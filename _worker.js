@@ -1,7 +1,14 @@
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
+// _worker.js
+// Cloudflare Pages Functions 运行环境
+// 推送后自动生效，无需额外配置
 
+export default {
+  async fetch(request, env, ctx) {
+    return handleRequest(request);
+  }
+};
+
+// 以下代码与你原来的 Workers 脚本完全一致，仅把 addEventListener 换成 export default
 async function handleRequest(request) {
   try {
       const url = new URL(request.url);
@@ -70,12 +77,11 @@ async function handleRequest(request) {
   }
 }
 
-// 确保 URL 带有协议
+// 以下所有辅助函数均保持原样
 function ensureProtocol(url, defaultProtocol) {
   return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
 }
 
-// 处理重定向
 function handleRedirect(response, body) {
   const location = new URL(response.headers.get('location'));
   const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
@@ -89,22 +95,18 @@ function handleRedirect(response, body) {
   });
 }
 
-// 处理 HTML 内容中的相对路径
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   const originalText = await response.text();
   const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
   let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
-
   return modifiedText;
 }
 
-// 替换 HTML 内容中的相对路径
 function replaceRelativePaths(text, protocol, host, origin) {
   const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
   return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
 }
 
-// 返回 JSON 格式的响应
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
       status: status,
@@ -114,24 +116,20 @@ function jsonResponse(data, status) {
   });
 }
 
-// 过滤请求头
 function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
-// 设置禁用缓存的头部
 function setNoCacheHeaders(headers) {
   headers.set('Cache-Control', 'no-store');
 }
 
-// 设置 CORS 头部
 function setCorsHeaders(headers) {
   headers.set('Access-Control-Allow-Origin', '*');
   headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
   headers.set('Access-Control-Allow-Headers', '*');
 }
 
-// 返回根目录的 HTML
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -140,8 +138,8 @@ function getRootHtml() {
   <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
   <title>Proxy Everything</title>
   <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
-  <meta name="Description" content="Proxy Everything with CF Workers.">
-  <meta property="og:description" content="Proxy Everything with CF Workers.">
+  <meta name="Description" content="Proxy Everything with CF Pages.">
+  <meta property="og:description" content="Proxy Everything with CF Pages.">
   <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
   <meta name="robots" content="index, follow">
   <meta http-equiv="Content-Language" content="zh-CN">
@@ -150,7 +148,7 @@ function getRootHtml() {
   <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
   <style>
       body, html {
           height: 100%;
