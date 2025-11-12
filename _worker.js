@@ -1,279 +1,246 @@
-const config = {
-  no_ref: "off", //Control the HTTP referrer header, if you want to create an anonymous link that will hide the HTTP Referer header, please set to "on" .
-  theme: "",//Homepage theme, use the empty value for default theme. To use urlcool theme, please fill with "theme/urlcool" .
-  cors: "on",//Allow Cross-origin resource sharing for API requests.
-  unique_link: false,//If it is true, the same long url will be shorten into the same short url
-  custom_link: true,//Allow users to customize the short url.
-  snapchat_mode: false,//The link will be distroyed after access.
-  visit_count: false,//Count visit times.
-  //system_type: "pastebin",// shorturl, pastebin, imghost,
-}
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
 
-let index_html = "https://wokaotianshi123.github.io/Url-Shorten-Worker/" + config.theme + "/index.html"
-let no_ref_html = "https://wokaotianshi123.github.io/Url-Shorten-Worker/no-ref.html"
-
-const html404 = `<!DOCTYPE html>
-  <html>
-  <body>
-    <h1>404 Not Found.</h1>
-    <p>The url you visit is not found.</p>
-    <p> <a href="https://github.com/wokaotianshi123/Url-Shorten-Worker/" target="_self">Fork me on GitHub</a> </p>
-  </body>
-  </html>`
-
-let response_header = {
-  "content-type": "text/html;charset=UTF-8",
-}
-
-if (config.cors == "on") {
-  response_header = {
-    "content-type": "text/html;charset=UTF-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST",
-    "Access-Control-Allow-Headers": "Content-Type",
-  }
-}
-
-async function randomString(len) {
-  len = len || 6;
-  let $chars = 'ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';    /****默认去掉了容易混淆的字符oOLl,9gq,Vv,Uu,I1****/
-  let maxPos = $chars.length;
-  let result = '';
-  for (i = 0; i < len; i++) {
-    result += $chars.charAt(Math.floor(Math.random() * maxPos));
-  }
-  return result;
-}
-
-async function sha512(url) {
-  url = new TextEncoder().encode(url)
-
-  const url_digest = await crypto.subtle.digest(
-    {
-      name: "SHA-512",
-    },
-    url, // The data you want to hash as an ArrayBuffer
-  )
-  const hashArray = Array.from(new Uint8Array(url_digest)); // convert buffer to byte array
-  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-  //console.log(hashHex)
-  return hashHex
-}
-async function checkURL(URL) {
-  let str = URL;
-  let Expression = /http(s)?:\/\/([\w-]+\.)+[\w-]+(\/[\w- .\/?%&=]*)?/;
-  let objExp = new RegExp(Expression);
-  if (objExp.test(str) == true) {
-    if (str[0] == 'h')
-      return true;
-    else
-      return false;
-  } else {
-    return false;
-  }
-}
-async function save_url(URL) {
-  let random_key = await randomString()
-  let is_exist = await LINKS.get(random_key)
-  console.log(is_exist)
-  if (is_exist == null) {
-    // 计数功能
-    if (config.visit_count) {
-      // 在保存链接的同时, 为其创建一个统计键并初始化为0
-      await LINKS.put(random_key + "-count", "0");
-    }
-    return await LINKS.put(random_key, URL), random_key
-  }
-  else
-    save_url(URL)
-}
-async function is_url_exist(url_sha512) {
-  let is_exist = await LINKS.get(url_sha512)
-  console.log(is_exist)
-  if (is_exist == null) {
-    return false
-  } else {
-    return is_exist
-  }
-}
 async function handleRequest(request) {
-  console.log(request)
+  try {
+      const url = new URL(request.url);
 
-  // 查KV中的password对应的值
-  const password_value = await LINKS.get("password");
-
-  if (request.method === "POST") {
-    let req = await request.json()
-
-    let req_cmd = req["cmd"]
-    let req_url = req["url"]
-    let req_key = req["key"]
-    let req_password = req["password"]
-
-    console.log(req_cmd)
-    console.log(req_url)
-    console.log(req_key)
-    console.log(req_password)
-
-    if (req_password != password_value) {
-      return new Response(`{"status":500,"key": "", "error":"Error: Invalid password."}`, {
-        headers: response_header,
-      })
-    }
-
-    if (req_cmd == "add") {
-      if (!await checkURL(req_url)) {
-        return new Response(`{"status":500, "url": "` + req_url + `", "error":"Error: Url illegal."}`, {
-          headers: response_header,
-        })
+      // 如果访问根目录，返回HTML
+      if (url.pathname === "/") {
+          return new Response(getRootHtml(), {
+              headers: {
+                  'Content-Type': 'text/html; charset=utf-8'
+              }
+          });
       }
 
-      let stat, random_key
-      if (config.custom_link && (req_key != "")) {
-        let is_exist = await LINKS.get(req_key)
-        if (is_exist != null) {
-          return new Response(`{"status":500,"key": "` + req_key + `", "error":"Error: Custom shortURL existed."}`, {
-            headers: response_header,
-          })
-        } else {
-          random_key = req_key
-          stat, await LINKS.put(req_key, req_url)
-        }
-      } else if (config.unique_link) {
-        let url_sha512 = await sha512(req_url)
-        let url_key = await is_url_exist(url_sha512)
-        if (url_key) {
-          random_key = url_key
-        } else {
-          stat, random_key = await save_url(req_url)
-          if (typeof (stat) == "undefined") {
-            console.log(await LINKS.put(url_sha512, random_key))
-          }
-        }
-      } else {
-        stat, random_key = await save_url(req_url)
-      }
-      console.log(stat)
-      if (typeof (stat) == "undefined") {
-        return new Response(`{"status":200, "key":"` + random_key + `", "error": ""}`, {
-          headers: response_header,
-        })
-      } else {
-        return new Response(`{"status":500, "key": "", "error":"Error:Reach the KV write limitation."}`, {
-          headers: response_header,
-        })
-      }
-    } else if (req_cmd == "del") {
-      await LINKS.delete(req_key)
-      
-      // 计数功能打开的话, 要把计数的那条KV也删掉
-      if (config.visit_count) {
-        await LINKS.delete(req_key + "-count")
+      // 从请求路径中提取目标 URL
+      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
+
+      // 判断用户输入的 URL 是否带有协议
+      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+
+      // 保留查询参数
+      actualUrlStr += url.search;
+
+      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
+
+      // 创建一个新的请求以访问目标 URL
+      const modifiedRequest = new Request(actualUrlStr, {
+          headers: newHeaders,
+          method: request.method,
+          body: request.body,
+          redirect: 'manual'
+      });
+
+      // 发起对目标 URL 的请求
+      const response = await fetch(modifiedRequest);
+      let body = response.body;
+
+      // 处理重定向
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+          body = response.body;
+          // 创建新的 Response 对象以修改 Location 头部
+          return handleRedirect(response, body);
+      } else if (response.headers.get("Content-Type")?.includes("text/html")) {
+          body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       }
 
-      return new Response(`{"status":200, "key": "` + req_key + `", "error": ""}`, {
-        headers: response_header,
-      })
-    } else if (req_cmd == "qry") {
-      let value = await LINKS.get(req_key)
-      if (value != null) {
-        return new Response(`{"status":200, "key": "` + req_key + `", "url": "` + value + `", "error":""}`, {
-          headers: response_header,
-        })
-      } else {
-        return new Response(`{"status":500, "key": "` + req_key + `", "error":"Error:shortURL not exist."}`, {
-          headers: response_header,
-        })
-      }
-    }
+      // 创建修改后的响应对象
+      const modifiedResponse = new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
+      });
 
-  } else if (request.method === "OPTIONS") {
-    return new Response(``, {
-      headers: response_header,
-    })
+      // 添加禁用缓存的头部
+      setNoCacheHeaders(modifiedResponse.headers);
+
+      // 添加 CORS 头部，允许跨域访问
+      setCorsHeaders(modifiedResponse.headers);
+
+      return modifiedResponse;
+  } catch (error) {
+      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
+      return jsonResponse({
+          error: error.message
+      }, 500);
   }
-
-  const requestURL = new URL(request.url)
-  const path = requestURL.pathname.split("/")[1]
-  const params = requestURL.search;
-
-  console.log(path)
-  // 如果path为空, 即直接访问网址
-  if (!path) {
-    return Response.redirect("https://zelikk.blogspot.com/search/label/Url-Shorten-Worker", 302)
-    /* new Response(html404, {
-      headers: {
-        "content-type": "text/html;charset=UTF-8",
-      },
-      status: 404
-    }) */
-  }
-
-  // 如果path符合password 显示应用界面
-  if (path == password_value) {
-    let index = await fetch(index_html)
-    index = await index.text()
-    index = index.replace(/__PASSWORD__/gm, password_value)
-    return new Response(index, {
-      headers: {
-        "content-type": "text/html;charset=UTF-8",
-      },
-    })
-  }
-
-  // 在KV中查询 短链接 对应的原链接
-  const value = await LINKS.get(path);
-  let location;
-
-  if (params) {
-    location = value + params
-  } else {
-    location = value
-  }
-  console.log(value)
-
-  if (location) {
-    // 计数功能
-    if (config.visit_count) {
-      // 获取并增加访问计数
-      let count = await LINKS.get(path + "-count");
-      if (count === null) {
-        await LINKS.put(path + "-count", "1"); // 初始化为1，因为这是首次访问
-      } else {
-        count = parseInt(count) + 1;
-        await LINKS.put(path + "-count", count.toString());
-      }
-    }
-
-    // 如果阅后即焚模式
-    if (config.snapchat_mode) {
-      // 删除KV中的记录
-      await LINKS.delete(path)
-    }
-
-    if (config.no_ref == "on") {
-      let no_ref = await fetch(no_ref_html)
-      no_ref = await no_ref.text()
-      no_ref = no_ref.replace(/{Replace}/gm, location)
-      return new Response(no_ref, {
-        headers: {
-          "content-type": "text/html;charset=UTF-8",
-        },
-      })
-    } else {
-      return Response.redirect(location, 302)
-    }
-  }
-  
-  // If request not in kv, return 404
-  return new Response(html404, {
-    headers: {
-      "content-type": "text/html;charset=UTF-8",
-    },
-    status: 404
-  })
 }
 
-addEventListener("fetch", async event => {
-  event.respondWith(handleRequest(event.request))
-})
+// 确保 URL 带有协议
+function ensureProtocol(url, defaultProtocol) {
+  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
+}
+
+// 处理重定向
+function handleRedirect(response, body) {
+  const location = new URL(response.headers.get('location'));
+  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
+  return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: {
+          ...response.headers,
+          'Location': modifiedLocation
+      }
+  });
+}
+
+// 处理 HTML 内容中的相对路径
+async function handleHtmlContent(response, protocol, host, actualUrlStr) {
+  const originalText = await response.text();
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
+
+  return modifiedText;
+}
+
+// 替换 HTML 内容中的相对路径
+function replaceRelativePaths(text, protocol, host, origin) {
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
+}
+
+// 返回 JSON 格式的响应
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+      status: status,
+      headers: {
+          'Content-Type': 'application/json; charset=utf-8'
+      }
+  });
+}
+
+// 过滤请求头
+function filterHeaders(headers, filterFunc) {
+  return new Headers([...headers].filter(([name]) => filterFunc(name)));
+}
+
+// 设置禁用缓存的头部
+function setNoCacheHeaders(headers) {
+  headers.set('Cache-Control', 'no-store');
+}
+
+// 设置 CORS 头部
+function setCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Headers', '*');
+}
+
+// 返回根目录的 HTML
+function getRootHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
+  <title>Proxy Everything</title>
+  <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="Description" content="Proxy Everything with CF Workers.">
+  <meta property="og:description" content="Proxy Everything with CF Workers.">
+  <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="robots" content="index, follow">
+  <meta http-equiv="Content-Language" content="zh-CN">
+  <meta name="copyright" content="Copyright © ymyuuu">
+  <meta name="author" content="ymyuuu">
+  <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <style>
+      body, html {
+          height: 100%;
+          margin: 0;
+      }
+      .background {
+          background-size: cover;
+          background-position: center;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+      }
+      .card {
+          background-color: rgba(255, 255, 255, 0.8);
+          transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+      .card:hover {
+          background-color: rgba(255, 255, 255, 1);
+          box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
+      }
+      .input-field input[type=text] {
+          color: #2c3e50;
+      }
+      .input-field input[type=text]:focus+label {
+          color: #2c3e50 !important;
+      }
+      .input-field input[type=text]:focus {
+          border-bottom: 1px solid #2c3e50 !important;
+          box-shadow: 0 1px 0 0 #2c3e50 !important;
+      }
+      @media (prefers-color-scheme: dark) {
+          body, html {
+              background-color: #121212;
+              color: #e0e0e0;
+          }
+          .card {
+              background-color: rgba(33, 33, 33, 0.9);
+              color: #ffffff;
+          }
+          .card:hover {
+              background-color: rgba(50, 50, 50, 1);
+              box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
+          }
+          .input-field input[type=text] {
+              color: #ffffff;
+          }
+          .input-field input[type=text]:focus+label {
+              color: #ffffff !important;
+          }
+          .input-field input[type=text]:focus {
+              border-bottom: 1px solid #ffffff !important;
+              box-shadow: 0 1px 0 0 #ffffff !important;
+          }
+          label {
+              color: #cccccc;
+          }
+      }
+  </style>
+</head>
+<body>
+  <div class="background">
+      <div class="container">
+          <div class="row">
+              <div class="col s12 m8 offset-m2 l6 offset-l3">
+                  <div class="card">
+                      <div class="card-content">
+                          <span class="card-title center-align"><i class="material-icons left">link</i>Proxy Everything</span>
+                          <form id="urlForm" onsubmit="redirectToProxy(event)">
+                              <div class="input-field">
+                                  <input type="text" id="targetUrl" placeholder="在此输入目标地址" required>
+                                  <label for="targetUrl">目标地址</label>
+                              </div>
+                              <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
+                          </form>
+                      </div>
+                  </div>
+              </div>
+          </div>
+      </div>
+  </div>
+  <script src="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+  <script>
+      function redirectToProxy(event) {
+          event.preventDefault();
+          const targetUrl = document.getElementById('targetUrl').value.trim();
+          const currentOrigin = window.location.origin;
+          window.open(currentOrigin + '/' + encodeURIComponent(targetUrl), '_blank');
+      }
+  </script>
+</body>
+</html>`;
+}
