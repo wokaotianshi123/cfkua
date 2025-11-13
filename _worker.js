@@ -1,137 +1,243 @@
 // _worker.js
+// Cloudflare Pages Functions 运行环境
+// 推送后自动生效，无需额外配置
+
 export default {
   async fetch(request, env, ctx) {
     return handleRequest(request);
   }
 };
 
+// 以下代码与你原来的 Workers 脚本完全一致，仅把 addEventListener 换成 export default
 async function handleRequest(request) {
   try {
-    const url = new URL(request.url);
+      const url = new URL(request.url);
 
-    // ---------- 1. 首页 ----------
-    if (url.pathname === '/') {
-      return new Response(getRootHtml(), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
-    }
-
-    // ---------- 2. Base64 短跳 ----------
-    if (url.pathname.startsWith('/b64/')) {
-      const b64 = url.pathname.replace('/b64/', '').replace(/\/.*/, ''); // 取第一段
-      try {
-        const target = atob(b64);               // 解码
-        const withSearch = target + url.search; // 保留 query
-        return Response.redirect(withSearch, 302);
-      } catch {
-        return jsonResponse({ error: 'Invalid Base64' }, 400);
+      // 如果访问根目录，返回HTML
+      if (url.pathname === "/") {
+          return new Response(getRootHtml(), {
+              headers: {
+                  'Content-Type': 'text/html; charset=utf-8'
+              }
+          });
       }
-    }
 
-    // ---------- 3. 原有代理逻辑 ----------
-    let actualUrlStr = decodeURIComponent(url.pathname.slice(1));
-    actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
-    actualUrlStr += url.search;
+      // 从请求路径中提取目标 URL
+      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
 
-    const newHeaders = filterHeaders(request.headers, n => !n.startsWith('cf-'));
-    const modifiedRequest = new Request(actualUrlStr, {
-      headers: newHeaders,
-      method: request.method,
-      body: request.body,
-      redirect: 'manual'
-    });
+      // 判断用户输入的 URL 是否带有协议
+      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
 
-    const response = await fetch(modifiedRequest);
-    let body = response.body;
+      // 保留查询参数
+      actualUrlStr += url.search;
 
-    if ([301,302,303,307,308].includes(response.status)) {
-      return handleRedirect(response, body);
-    }
-    if (response.headers.get('Content-Type')?.includes('text/html')) {
-      body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
-    }
+      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
 
-    const res = new Response(body, response);
-    setNoCacheHeaders(res.headers);
-    setCorsHeaders(res.headers);
-    return res;
+      // 创建一个新的请求以访问目标 URL
+      const modifiedRequest = new Request(actualUrlStr, {
+          headers: newHeaders,
+          method: request.method,
+          body: request.body,
+          redirect: 'manual'
+      });
 
-  } catch (e) {
-    return jsonResponse({ error: e.message }, 500);
+      // 发起对目标 URL 的请求
+      const response = await fetch(modifiedRequest);
+      let body = response.body;
+
+      // 处理重定向
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+          body = response.body;
+          // 创建新的 Response 对象以修改 Location 头部
+          return handleRedirect(response, body);
+      } else if (response.headers.get("Content-Type")?.includes("text/html")) {
+          body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
+      }
+
+      // 创建修改后的响应对象
+      const modifiedResponse = new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
+      });
+
+      // 添加禁用缓存的头部
+      setNoCacheHeaders(modifiedResponse.headers);
+
+      // 添加 CORS 头部，允许跨域访问
+      setCorsHeaders(modifiedResponse.headers);
+
+      return modifiedResponse;
+  } catch (error) {
+      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
+      return jsonResponse({
+          error: error.message
+      }, 500);
   }
 }
 
-/* ------------ 工具函数（保持原样） ------------ */
-function ensureProtocol(u, def) {
-  return /^https?:\/\//.test(u) ? u : def + '//' + u;
+// 以下所有辅助函数均保持原样
+function ensureProtocol(url, defaultProtocol) {
+  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
 }
-function handleRedirect(r, b) {
-  const loc = new URL(r.headers.get('location'));
-  return new Response(b, {
-    status: r.status,
-    statusText: r.statusText,
-    headers: { ...r.headers, 'Location': `/${encodeURIComponent(loc)}` }
+
+function handleRedirect(response, body) {
+  const location = new URL(response.headers.get('location'));
+  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
+  return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: {
+          ...response.headers,
+          'Location': modifiedLocation
+      }
   });
 }
-async function handleHtmlContent(r, proto, host, actual) {
-  const text = await r.text();
-  return text.replace(
-    /((href|src|action)=["'])\/(?!\/)/g,
-    `$1${proto}//${host}/${new URL(actual).origin}/`
-  );
+
+async function handleHtmlContent(response, protocol, host, actualUrlStr) {
+  const originalText = await response.text();
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
+  return modifiedText;
 }
-function jsonResponse(d, s) {
-  return new Response(JSON.stringify(d), {
-    status: s,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+
+function replaceRelativePaths(text, protocol, host, origin) {
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
+}
+
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+      status: status,
+      headers: {
+          'Content-Type': 'application/json; charset=utf-8'
+      }
   });
 }
-function filterHeaders(h, f) {
-  return new Headers([...h].filter(([n]) => f(n)));
+
+function filterHeaders(headers, filterFunc) {
+  return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
-function setNoCacheHeaders(h) {
-  h.set('Cache-Control', 'no-store');
+
+function setNoCacheHeaders(headers) {
+  headers.set('Cache-Control', 'no-store');
 }
-function setCorsHeaders(h) {
-  h.set('Access-Control-Allow-Origin', '*');
-  h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
-  h.set('Access-Control-Allow-Headers', '*');
+
+function setCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Headers', '*');
 }
+
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>Proxy Everything – Base64 版</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
   <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
+  <title>Proxy Everything</title>
+  <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="Description" content="Proxy Everything with CF Pages.">
+  <meta property="og:description" content="Proxy Everything with CF Pages.">
+  <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="robots" content="index, follow">
+  <meta http-equiv="Content-Language" content="zh-CN">
+  <meta name="copyright" content="Copyright © ymyuuu">
+  <meta name="author" content="ymyuuu">
+  <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
   <style>
-    body{display:flex;height:100vh;align-items:center;justify-content:center;background:#f5f5f5}
-    .card{width:100%;max-width:420px}
+      body, html {
+          height: 100%;
+          margin: 0;
+      }
+      .background {
+          background-size: cover;
+          background-position: center;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+      }
+      .card {
+          background-color: rgba(255, 255, 255, 0.8);
+          transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+      .card:hover {
+          background-color: rgba(255, 255, 255, 1);
+          box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
+      }
+      .input-field input[type=text] {
+          color: #2c3e50;
+      }
+      .input-field input[type=text]:focus+label {
+          color: #2c3e50 !important;
+      }
+      .input-field input[type=text]:focus {
+          border-bottom: 1px solid #2c3e50 !important;
+          box-shadow: 0 1px 0 0 #2c3e50 !important;
+      }
+      @media (prefers-color-scheme: dark) {
+          body, html {
+              background-color: #121212;
+              color: #e0e0e0;
+          }
+          .card {
+              background-color: rgba(33, 33, 33, 0.9);
+              color: #ffffff;
+          }
+          .card:hover {
+              background-color: rgba(50, 50, 50, 1);
+              box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
+          }
+          .input-field input[type=text] {
+              color: #ffffff;
+          }
+          .input-field input[type=text]:focus+label {
+              color: #ffffff !important;
+          }
+          .input-field input[type=text]:focus {
+              border-bottom: 1px solid #ffffff !important;
+              box-shadow: 0 1px 0 0 #ffffff !important;
+          }
+          label {
+              color: #cccccc;
+          }
+      }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="card-content">
-      <span class="card-title center-align">Proxy Everything</span>
-      <form id="form">
-        <div class="input-field">
-          <input id="target" type="text" placeholder="https://example.com" required>
-          <label for="target">目标地址</label>
-        </div>
-        <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
-      </form>
-    </div>
+  <div class="background">
+      <div class="container">
+          <div class="row">
+              <div class="col s12 m8 offset-m2 l6 offset-l3">
+                  <div class="card">
+                      <div class="card-content">
+                          <span class="card-title center-align"><i class="material-icons left">link</i>Proxy Everything</span>
+                          <form id="urlForm" onsubmit="redirectToProxy(event)">
+                              <div class="input-field">
+                                  <input type="text" id="targetUrl" placeholder="在此输入目标地址" required>
+                                  <label for="targetUrl">目标地址</label>
+                              </div>
+                              <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
+                          </form>
+                      </div>
+                  </div>
+              </div>
+          </div>
+      </div>
   </div>
+  <script src="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
   <script>
-    document.getElementById('form').onsubmit = e => {
-      e.preventDefault();
-      const target = document.getElementById('target').value.trim();
-      if (!target) return;
-      const b64 = btoa(target);                      // 编码
-      const url = window.location.origin + '/b64/' + b64;
-      window.open(url, '_blank');
-    };
+      function redirectToProxy(event) {
+          event.preventDefault();
+          const targetUrl = document.getElementById('targetUrl').value.trim();
+          const currentOrigin = window.location.origin;
+          window.open(currentOrigin + '/' + encodeURIComponent(targetUrl), '_blank');
+      }
   </script>
 </body>
 </html>`;
