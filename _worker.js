@@ -1,15 +1,19 @@
 // _worker.js
 
-// 常量定义
-const ASSET_EXTENSIONS = new Set([
-  "js", "css", "png", "jpg", "jpeg", "gif", "svg", "ico", "woff", "woff2", "ttf", "eot", "mp4", "webm", "mp3"
+// 想要移除的响应头 (解决 CSP, Frame 限制等问题)
+const UNSAFE_HEADERS = new Set([
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "x-frame-options",
+  "x-xss-protection",
+  "x-content-type-options"
 ]);
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. 访问根目录，返回 UI 界面
+    // 1. 访问根目录，返回 UI
     if (url.pathname === "/") {
       return new Response(getRootHtml(), {
         headers: { "Content-Type": "text/html; charset=utf-8" }
@@ -17,122 +21,192 @@ export default {
     }
 
     // 2. 解析目标 URL
-    // 逻辑：路径即为目标URL。例如 proxy.com/https://google.com
+    // 格式: https://proxy-domain.com/https://google.com/foo
     let actualUrlStr = url.pathname.slice(1) + url.search + url.hash;
 
-    // 3. 特殊情况处理：处理浏览器发出的相对路径请求（如 /favicon.ico）
-    // 如果用户访问 proxy.com/https://site.com，HTML里有个 <img src="/logo.png">
-    // 浏览器会请求 proxy.com/logo.png。我们需要尝试通过 Referer 找回原来的目标。
+    // 处理浏览器自动请求的相对路径资源 (如 /favicon.ico, /sw.js)
     if (!actualUrlStr.startsWith("http")) {
       const referer = request.headers.get("Referer");
       if (referer) {
         try {
           const refererUrl = new URL(referer);
-          // 检查 Referer 是否也是咱们的代理
-          if (refererUrl.origin === url.origin && refererUrl.pathname !== "/") {
-            // 提取 Referer 中的目标根路径
-            // refererPath: /https://target.com/page/1
-            const refererTarget = refererUrl.pathname.slice(1);
-            const targetBase = new URL(refererTarget).origin;
-            actualUrlStr = targetBase + "/" + actualUrlStr;
+          // 如果 Referer 也是我们的代理地址，尝试从中提取真实的目标根域名
+          if (refererUrl.origin === url.origin) {
+            const refererPath = refererUrl.pathname.slice(1);
+            if (refererPath.startsWith("http")) {
+              const refererTarget = new URL(refererPath);
+              actualUrlStr = new URL(actualUrlStr, refererTarget.href).href;
+            }
           }
-        } catch (e) {
-          // Referer 解析失败，忽略
-        }
+        } catch (e) {}
       }
     }
 
-    // 兜底：如果还是没有协议，尝试加 https
-    if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
-       // 如果看起来像域名，加 https，否则可能是一个无法处理的资源
-       if (actualUrlStr.includes(".")) {
+    // 如果还是没有协议，尝试补全 (针对手动输入 www.google.com 的情况)
+    if (!actualUrlStr.startsWith("http")) {
+      if (/^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/.test(actualUrlStr)) {
          actualUrlStr = "https://" + actualUrlStr;
-       } else {
-         return new Response("Invalid URL", { status: 400 });
-       }
+      } else {
+         // 无法解析的 URL，直接返回 404 或让 fetch 抛出错误
+      }
     }
 
-    // 4. 发起代理请求
-    try {
-      // 过滤掉 Cloudflare 自身的 headers 和不安全的 headers
-      const newHeaders = new Headers();
-      for (const [key, value] of request.headers) {
-        if (!key.startsWith("cf-") && key.toLowerCase() !== "host") {
-          newHeaders.set(key, value);
+    // 3. 处理 OPTIONS 预检请求 (解决 CORS 报错)
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+          "Access-Control-Allow-Headers": "*"
         }
-      }
-      
-      // 构造新请求
-      const modifiedRequest = new Request(actualUrlStr, {
-        headers: newHeaders,
+      });
+    }
+
+    // 4. 准备代理请求
+    let targetUrl;
+    try {
+      targetUrl = new URL(actualUrlStr);
+    } catch (e) {
+      return new Response("Invalid URL: " + actualUrlStr, { status: 400 });
+    }
+
+    const newHeaders = new Headers();
+    // 复制原请求头，但过滤掉 CF 特定头
+    for (const [key, value] of request.headers) {
+      if (key.startsWith("cf-")) continue;
+      newHeaders.set(key, value);
+    }
+
+    // 关键：伪造 Host, Origin, Referer，欺骗目标服务器
+    newHeaders.set("Host", targetUrl.host);
+    newHeaders.set("Origin", targetUrl.origin);
+    newHeaders.set("Referer", targetUrl.href);
+
+    // 5. 发起请求
+    let response;
+    try {
+      response = await fetch(actualUrlStr, {
         method: request.method,
+        headers: newHeaders,
         body: request.body,
         redirect: "manual" // 手动处理重定向
       });
-
-      const response = await fetch(modifiedRequest);
-      
-      // 5. 处理响应
-      let newResponse;
-      const contentType = response.headers.get("Content-Type") || "";
-
-      // 情况 A: 重定向 (3xx)
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        const location = response.headers.get("Location");
-        if (location) {
-          // 将重定向地址重写回代理地址
-          const resolvedLocation = new URL(location, actualUrlStr).toString();
-          const proxyLocation = url.origin + "/" + resolvedLocation;
-          newResponse = new Response(response.body, response);
-          newResponse.headers.set("Location", proxyLocation);
-        } else {
-          newResponse = new Response(response.body, response);
-        }
-      }
-      // 情况 B: HTML 内容 (使用 HTMLRewriter 重写链接)
-      else if (contentType.includes("text/html")) {
-        const rewriter = new HTMLRewriter()
-          .on("a", new AttributeRewriter("href", url.origin, actualUrlStr))
-          .on("img", new AttributeRewriter("src", url.origin, actualUrlStr))
-          .on("link", new AttributeRewriter("href", url.origin, actualUrlStr))
-          .on("script", new AttributeRewriter("src", url.origin, actualUrlStr))
-          .on("form", new AttributeRewriter("action", url.origin, actualUrlStr))
-          .on("iframe", new AttributeRewriter("src", url.origin, actualUrlStr))
-          .on("video", new AttributeRewriter("src", url.origin, actualUrlStr))
-          .on("audio", new AttributeRewriter("src", url.origin, actualUrlStr))
-          .on("source", new AttributeRewriter("src", url.origin, actualUrlStr))
-          .on("object", new AttributeRewriter("data", url.origin, actualUrlStr));
-
-        newResponse = rewriter.transform(response);
-      }
-      // 情况 C: 其他内容 (直接透传)
-      else {
-        newResponse = new Response(response.body, response);
-      }
-
-      // 6. 添加必要的 CORS 和 缓存控制
-      newResponse.headers.set("Access-Control-Allow-Origin", "*");
-      newResponse.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-      newResponse.headers.set("Access-Control-Allow-Headers", "*");
-      // 为了防止浏览器缓存错误的重写结果，建议不缓存 HTML，但静态资源可以缓存
-      if (contentType.includes("text/html")) {
-        newResponse.headers.set("Cache-Control", "no-cache, no-store, must-revalidate");
-      }
-
-      return newResponse;
-
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" }
-      });
+    } catch (e) {
+      return new Response("Proxy Error: " + e.message, { status: 500 });
     }
+
+    // 6. 处理响应头
+    const responseHeaders = new Headers(response.headers);
+    
+    // 移除安全限制头
+    UNSAFE_HEADERS.forEach(h => responseHeaders.delete(h));
+
+    // 允许跨域
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Credentials", "true");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+
+    // 重写重定向 Location
+    const location = responseHeaders.get("Location");
+    if (location) {
+      try {
+        const absoluteLocation = new URL(location, targetUrl.href).href;
+        responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
+      } catch (e) {}
+    }
+
+    // 重写 Set-Cookie (移除 Domain 限制)
+    const setCookie = responseHeaders.get("Set-Cookie");
+    if (setCookie) {
+      const newCookie = setCookie
+        .replace(/Domain=[^;]+;?/gi, "")
+        .replace(/Secure;?/gi, "")
+        .replace(/SameSite=[^;]+;?/gi, "");
+      responseHeaders.set("Set-Cookie", newCookie);
+    }
+
+    const contentType = responseHeaders.get("Content-Type") || "";
+
+    // 7. 处理 HTML 内容 (注入脚本 + 重写链接)
+    if (contentType.includes("text/html")) {
+      const rewriter = new HTMLRewriter()
+        .on("head", {
+          element(element) {
+            // 注入客户端脚本：禁用 ServiceWorker，劫持 fetch/xhr
+            element.append(`
+            <script>
+              (function() {
+                const PROXY_ORIGIN = window.location.origin;
+                
+                // 1. 禁用 Service Worker (解决 YouTube 等网站的 sw.js 报错)
+                if (navigator.serviceWorker) {
+                    navigator.serviceWorker.register = function() { 
+                        console.log('SW registration blocked by proxy');
+                        return new Promise(() => {}); 
+                    };
+                    navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
+                }
+
+                // 2. 劫持 fetch
+                const oldFetch = window.fetch;
+                window.fetch = function(input, init) {
+                    let url = input;
+                    if (typeof input === 'string') {
+                        // 如果是绝对路径且不是代理域名，强制走代理
+                        if (input.startsWith('http') && !input.startsWith(PROXY_ORIGIN)) {
+                            url = PROXY_ORIGIN + '/' + input;
+                        } else if (input.startsWith('//')) {
+                            url = PROXY_ORIGIN + '/https:' + input;
+                        }
+                    }
+                    return oldFetch(url, init);
+                };
+
+                // 3. 劫持 XHR
+                const oldOpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function(method, url, ...args) {
+                    if (typeof url === 'string') {
+                        if (url.startsWith('http') && !url.startsWith(PROXY_ORIGIN)) {
+                            url = PROXY_ORIGIN + '/' + url;
+                        } else if (url.startsWith('//')) {
+                            url = PROXY_ORIGIN + '/https:' + url;
+                        }
+                    }
+                    return oldOpen.call(this, method, url, ...args);
+                };
+              })();
+            </script>`, { html: true });
+          }
+        })
+        .on("a", new AttributeRewriter("href", url.origin, targetUrl.href))
+        .on("img", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("link", new AttributeRewriter("href", url.origin, targetUrl.href))
+        .on("script", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("form", new AttributeRewriter("action", url.origin, targetUrl.href))
+        .on("iframe", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("video", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("audio", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("source", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("object", new AttributeRewriter("data", url.origin, targetUrl.href));
+
+      return rewriter.transform(new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders
+      }));
+    }
+
+    // 非 HTML 内容直接返回
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders
+    });
   }
 };
 
 /**
- * HTMLRewriter 的处理类
- * 用于将 HTML 中的相对路径/绝对路径转换为代理路径
+ * HTMLRewriter 处理类，用于重写 HTML 中的 URL 属性
  */
 class AttributeRewriter {
   constructor(attributeName, proxyOrigin, currentTargetUrl) {
@@ -144,90 +218,79 @@ class AttributeRewriter {
   element(element) {
     const value = element.getAttribute(this.attributeName);
     if (value) {
+      // 跳过特殊协议
+      if (value.startsWith("data:") || value.startsWith("#") || value.startsWith("mailto:") || value.startsWith("javascript:")) return;
+      
       try {
-        // 忽略特殊协议
-        if (value.startsWith("data:") || value.startsWith("#") || value.startsWith("mailto:") || value.startsWith("javascript:")) {
-          return;
-        }
-
-        // 解析完整的目标 URL (处理 ./, ../, / 等相对路径)
-        const resolvedUrl = new URL(value, this.currentTargetUrl).toString();
-        
-        // 构造代理 URL: proxy.com/https://target.com/path
-        const proxiedUrl = this.proxyOrigin + "/" + resolvedUrl;
-        
-        element.setAttribute(this.attributeName, proxiedUrl);
-      } catch (e) {
-        // 解析失败则保留原样
-      }
+        // 计算绝对路径
+        const resolvedUrl = new URL(value, this.currentTargetUrl).href;
+        // 加上代理前缀
+        element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
+      } catch (e) {}
     }
     
-    // 特殊处理 srcset (用于响应式图片)
-    if (element.tagName === 'img' && element.hasAttribute('srcset')) {
-      const srcset = element.getAttribute('srcset');
-      const newSrcset = srcset.split(',').map(srcDef => {
-        const [src, width] = srcDef.trim().split(/\s+/);
-        try {
-           const resolvedSrc = new URL(src, this.currentTargetUrl).toString();
-           return `${this.proxyOrigin}/${resolvedSrc} ${width || ''}`;
-        } catch (e) { return srcDef; }
-      }).join(', ');
-      element.setAttribute('srcset', newSrcset);
+    // 特殊处理 srcset
+    if (element.tagName === "img" && element.hasAttribute("srcset")) {
+        const srcset = element.getAttribute("srcset");
+        const newSrcset = srcset.split(",").map(part => {
+            const [url, desc] = part.trim().split(/\s+/);
+            try {
+                const resolved = new URL(url, this.currentTargetUrl).href;
+                return this.proxyOrigin + "/" + resolved + (desc ? " " + desc : "");
+            } catch(e) { return part; }
+        }).join(", ");
+        element.setAttribute("srcset", newSrcset);
     }
   }
 }
 
-/**
- * UI 页面代码 (保持了你的原版风格，增强了 Materialize 引用)
- */
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>Proxy Everything</title>
   <link href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <title>Proxy Everything</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-      body { display: flex; min-height: 100vh; flex-direction: column; background: #f5f5f5; }
-      main { flex: 1 0 auto; display: flex; align-items: center; justify-content: center; }
-      .card { min-width: 350px; padding: 20px; }
+      body, html { height: 100%; margin: 0; background-color: #f5f5f5; }
+      .background { height: 100%; display: flex; align-items: center; justify-content: center; }
+      .card { min-width: 350px; }
       .input-field input:focus + label { color: #26a69a !important; }
       .input-field input:focus { border-bottom: 1px solid #26a69a !important; box-shadow: 0 1px 0 0 #26a69a !important; }
   </style>
 </head>
 <body>
-  <main>
+  <div class="background">
       <div class="container">
           <div class="row">
               <div class="col s12 m8 offset-m2 l6 offset-l3">
                   <div class="card hoverable">
                       <div class="card-content">
                           <span class="card-title center-align"><i class="material-icons left">public</i>Proxy Everything</span>
-                          <p class="center-align grey-text" style="margin-bottom: 20px;">输入完整 URL (如 https://google.com)</p>
-                          <form onsubmit="handleSubmit(event)">
+                          <form onsubmit="redirectToProxy(event)">
                               <div class="input-field">
-                                  <input type="text" id="url" required placeholder="https://example.com">
-                                  <label for="url">目标地址</label>
+                                  <input type="text" id="targetUrl" placeholder="https://www.youtube.com" required>
+                                  <label for="targetUrl">Target URL</label>
                               </div>
-                              <button type="submit" class="btn waves-effect waves-light teal lighten-1 w-100" style="width:100%">
-                                  访问 <i class="material-icons right">send</i>
-                              </button>
+                              <button type="submit" class="btn waves-effect waves-light teal lighten-1" style="width: 100%">Go</button>
                           </form>
                       </div>
                   </div>
               </div>
           </div>
       </div>
-  </main>
+  </div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
   <script>
-      function handleSubmit(e) {
-          e.preventDefault();
-          let url = document.getElementById('url').value.trim();
-          if (!url.startsWith('http')) url = 'https://' + url;
-          window.location.href = window.location.origin + '/' + url;
+      function redirectToProxy(event) {
+          event.preventDefault();
+          let targetUrl = document.getElementById('targetUrl').value.trim();
+          if (!targetUrl.startsWith('http')) {
+              targetUrl = 'https://' + targetUrl;
+          }
+          window.location.href = window.location.origin + '/' + targetUrl;
       }
   </script>
 </body>
