@@ -46,18 +46,18 @@ export default {
              const refererTarget = refererObj.pathname.slice(1);
              if (refererTarget.startsWith("http")) {
                 const targetBase = new URL(refererTarget);
+                // 解决相对路径 ../v1/api
                 actualUrlStr = new URL(actualUrlStr, targetBase.href).href;
                 fixed = true;
              }
            }
          } catch(e) {}
        }
-       // 如果 Referer 没救回来，且看起来像个域名，默认加 https
+       // 如果 Referer 没救回来，默认加 https
        if (!fixed) {
            if (actualUrlStr.includes(".") && !actualUrlStr.startsWith("/")) {
                actualUrlStr = "https://" + actualUrlStr;
            } else {
-               // 可能是根目录下的直接资源请求，尝试修正
                actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
            }
        }
@@ -79,8 +79,7 @@ export default {
     let targetUrl;
     try {
       if (!actualUrlStr.startsWith("http")) {
-          // 最后的挽救：如果还是没有协议，可能是 favicon.ico 这种，放弃或返回 404
-          return new Response("Invalid URL: " + actualUrlStr, { status: 404 });
+          return new Response("Invalid URL", { status: 404 });
       }
       targetUrl = new URL(actualUrlStr);
     } catch (e) {
@@ -94,23 +93,38 @@ export default {
       newHeaders.set(key, value);
     }
 
-    // 伪装 Host 和 Origin
+    // 伪装 Host
     newHeaders.set("Host", targetUrl.host);
-    newHeaders.set("Origin", targetUrl.origin);
+    
+    // Origin: GET 请求通常不发 Origin，只有 POST/PUT 等需要
+    // 发送错误的 Origin 可能导致 403
+    if (["GET", "HEAD"].includes(request.method)) {
+        newHeaders.delete("Origin"); 
+    } else {
+        newHeaders.set("Origin", targetUrl.origin);
+    }
+
     newHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
     // 智能 Referer 处理
+    // 很多视频站防盗链策略：要求 Referer 必须是其域名下的页面
+    // 我们强制将 Referer 设置为目标网站的 Origin + Path (如果是 HTML) 或者 Origin (如果是资源)
     const clientReferer = request.headers.get("Referer");
     if (clientReferer && clientReferer.startsWith(url.origin)) {
         const realRefererPart = clientReferer.slice(url.origin.length + 1);
         if (realRefererPart.startsWith("http")) {
-             newHeaders.set("Referer", realRefererPart);
+             // 如果是 HTML 页面请求，保留完整路径作为 Referer
+             // 如果是资源请求 (js, css, img, ts)，通常只发送 Origin 即可，兼容性更好
+             const ext = targetUrl.pathname.split('.').pop().toLowerCase();
+             if (["js", "css", "jpg", "jpeg", "png", "gif", "ts", "m4s", "mp4"].includes(ext)) {
+                 newHeaders.set("Referer", targetUrl.origin + "/");
+             } else {
+                 newHeaders.set("Referer", realRefererPart);
+             }
         } else {
-             // 无法还原时，使用目标根域名作为 Referer (比完整 URL 更安全，不易被防盗链拦截)
              newHeaders.set("Referer", targetUrl.origin + "/");
         }
     } else {
-        // 直接访问时，默认 Referer 设为 Origin
         newHeaders.set("Referer", targetUrl.origin + "/");
     }
 
@@ -135,21 +149,22 @@ export default {
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
 
-    // 6.1 Cookie 修复 (关键: 移除 Domain 属性，确保 Cookie 能写入代理域名)
+    // 6.1 Cookie 修复 
+    // 移除 Domain，强制 Path=/, 添加 SameSite=None; Secure 以支持跨域
     const setCookie = responseHeaders.get("Set-Cookie");
     if (setCookie) {
-        // Cloudflare Workers 有时会合并 Set-Cookie，我们需要尽量处理
-        // 注意：标准 Fetch API 中获取 Set-Cookie 可能受限，但在 Workers 环境通常可行
-        // 简单替换：将 Domain=xxx; 移除
-        const newCookie = setCookie.replace(/Domain=[^;]+;?/gi, "");
+        const newCookie = setCookie
+            .replace(/Domain=[^;]+;?/gi, "")
+            .replace(/Path=[^;]+;?/gi, "") + "; Path=/; SameSite=None; Secure";
         responseHeaders.set("Set-Cookie", newCookie);
     }
-    // 如果有 getSetCookie API (新版 Workers)
+    // 兼容新版 Workers API
     if (typeof responseHeaders.getSetCookie === 'function') {
          const cookies = responseHeaders.getSetCookie();
          responseHeaders.delete("Set-Cookie");
          cookies.forEach(c => {
-             const cleanCookie = c.replace(/Domain=[^;]+;?/gi, "");
+             let cleanCookie = c.replace(/Domain=[^;]+;?/gi, "").replace(/Path=[^;]+;?/gi, "");
+             cleanCookie += "; Path=/; SameSite=None; Secure";
              responseHeaders.append("Set-Cookie", cleanCookie);
          });
     }
@@ -167,7 +182,7 @@ export default {
 
     // 7. 内容重写
     
-    // A. M3U8 视频流重写 (修复视频播放)
+    // A. M3U8 视频流重写
     if (contentType.includes("mpegurl") || actualUrlStr.endsWith(".m3u8")) {
         let text = await response.text();
         const baseUrl = actualUrlStr.substring(0, actualUrlStr.lastIndexOf("/") + 1);
@@ -175,6 +190,7 @@ export default {
             match = match.trim();
             if (!match) return match;
             try {
+                // 解决相对路径
                 const absUrl = match.startsWith("http") ? match : new URL(match, baseUrl).href;
                 return url.origin + "/" + absUrl;
             } catch (e) { return match; }
@@ -182,7 +198,7 @@ export default {
         return new Response(text, { status: response.status, headers: responseHeaders });
     }
 
-    // B. HTML 重写 (注入 JS 劫持)
+    // B. HTML 重写
     if (contentType.includes("text/html")) {
       const rewriter = new HTMLRewriter()
         .on("head", {
@@ -191,42 +207,77 @@ export default {
             <script>
               (function() {
                 const PROXY = window.location.origin;
+                // 保存当前页面的真实 URL，用于相对路径计算
                 const BASE = '${targetUrl.href}'; 
+                
                 function wrap(u) {
-                    if (!u || u.startsWith(PROXY) || u.startsWith('data:') || u.startsWith('javascript:')) return u;
-                    try { return PROXY + '/' + new URL(u, BASE).href; } catch(e) { return u; }
+                    if (!u || typeof u !== 'string') return u;
+                    if (u.startsWith(PROXY) || u.startsWith('data:') || u.startsWith('javascript:') || u.startsWith('#')) return u;
+                    // 忽略纯粹的 hash 或空
+                    if (!u.trim()) return u;
+                    
+                    try { 
+                        // 处理 //example.com
+                        if (u.startsWith('//')) return PROXY + '/https:' + u;
+                        // 处理绝对路径 /api
+                        if (u.startsWith('/')) return PROXY + '/' + new URL(u, BASE).origin + u;
+                        // 处理 http
+                        if (u.startsWith('http')) return PROXY + '/' + u;
+                        // 处理相对路径
+                        return PROXY + '/' + new URL(u, BASE).href; 
+                    } catch(e) { return u; }
                 }
                 
-                // 劫持 fetch
+                // 1. 劫持 fetch
                 const _fetch = window.fetch;
                 window.fetch = function(input, init) {
                     if (typeof input === 'string') input = wrap(input);
+                    else if (input instanceof Request) {
+                        // 如果是 Request 对象，难以直接修改 url (只读)，只能新建
+                        // 这里简化处理，大多数情况 input 是 string
+                    }
                     return _fetch(input, init);
                 };
                 
-                // 劫持 XHR
+                // 2. 劫持 XHR
                 const _open = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(m, u, ...a) {
                     return _open.call(this, m, wrap(u), ...a);
                 };
 
-                // 劫持 DOM 属性赋值 (img.src = ...)
-                ['src', 'href', 'action'].forEach(prop => {
-                    const protos = [HTMLImageElement, HTMLAnchorElement, HTMLLinkElement, HTMLScriptElement, HTMLFormElement, HTMLMediaElement, HTMLSourceElement];
-                    protos.forEach(Proto => {
-                        if (!Proto) return;
-                        const desc = Object.getOwnPropertyDescriptor(Proto.prototype, prop);
-                        if (desc && desc.set) {
-                            Object.defineProperty(Proto.prototype, prop, {
-                                set: function(v) { desc.set.call(this, wrap(v)); },
-                                get: desc.get, enumerable: true, configurable: true
-                            });
-                        }
-                    });
-                });
+                // 3. 劫持 DOM 属性赋值 (核心：解决 js 动态拼接)
+                const tags = {
+                    'img': 'src', 'script': 'src', 'link': 'href', 'a': 'href',
+                    'iframe': 'src', 'video': 'src', 'audio': 'src', 'source': 'src', 'form': 'action'
+                };
                 
-                // 禁用 SW
-                if(navigator.serviceWorker) navigator.serviceWorker.register = () => new Promise(()=>{});
+                for (const [tag, attr] of Object.entries(tags)) {
+                    const elProto = window[tag.toUpperCase() + 'Element'] || window['HTML' + tag.charAt(0).toUpperCase() + tag.slice(1) + 'Element'];
+                    if (!elProto) continue;
+                    
+                    const desc = Object.getOwnPropertyDescriptor(elProto.prototype, attr);
+                    if (desc && desc.set) {
+                        Object.defineProperty(elProto.prototype, attr, {
+                            set: function(v) { 
+                                // 只有当赋值非空时才重写
+                                if(v) {
+                                   desc.set.call(this, wrap(v)); 
+                                } else {
+                                   desc.set.call(this, v);
+                                }
+                            },
+                            get: desc.get, 
+                            enumerable: true, 
+                            configurable: true
+                        });
+                    }
+                }
+                
+                // 4. 禁用 ServiceWorker (防止 sw 接管请求导致 404/跨域)
+                if(navigator.serviceWorker) {
+                    navigator.serviceWorker.register = () => new Promise(()=>{});
+                    navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+                }
               })();
             </script>`, { html: true });
           }
@@ -264,14 +315,21 @@ class AttributeRewriter {
   }
   element(el) {
     const v = el.getAttribute(this.attr);
-    if (v && !v.startsWith("data:") && !v.startsWith("javascript:")) {
-        try { el.setAttribute(this.attr, this.proxy + "/" + new URL(v, this.target).href); } catch(e){}
+    if (v && !v.startsWith("data:") && !v.startsWith("javascript:") && !v.startsWith("#")) {
+        try { 
+            // 解决 HTML 中已经是绝对路径的情况
+            if (v.startsWith("http")) {
+                el.setAttribute(this.attr, this.proxy + "/" + v);
+            } else {
+                el.setAttribute(this.attr, this.proxy + "/" + new URL(v, this.target).href); 
+            }
+        } catch(e){}
     }
     if (el.tagName === "img" && el.hasAttribute("srcset")) {
-        // 简单处理 srcset，防止语法报错
         try {
             const val = el.getAttribute("srcset");
-            el.setAttribute("srcset", val.replace(/https?:\/\//g, this.proxy + "/$&"));
+            // 简单粗暴替换 http -> proxy/http
+            el.setAttribute("srcset", val.replace(/(https?:\/\/)/g, this.proxy + "/$1"));
         } catch(e) {}
     }
   }
