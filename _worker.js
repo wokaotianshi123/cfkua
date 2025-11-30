@@ -42,44 +42,67 @@ export default {
         });
     }
 
-    // --- 核心修复：URL 清洗 ---
-    // 解决 "zh/https://..." 这种重复拼接的问题
-    // 如果路径中包含 http/https，提取它及其之后的部分
-    const protocolMatch = actualUrlStr.match(/(https?:\/\/.+)/);
-    if (protocolMatch) {
-        actualUrlStr = protocolMatch[1];
+    // --- 核心修复：URL 清洗 (解决 zh/https:// 问题) ---
+    // 提取路径中最后一个 http/https，解决多重代理或重定向导致的路径污染
+    // 比如 /zh/https://tktube.com -> https://tktube.com
+    const protocolMatches = actualUrlStr.match(/(https?:\/\/[^\/]+)/g);
+    if (protocolMatches && protocolMatches.length > 0) {
+        // 通常取第一个匹配到的完整 URL 即可，但也需要处理查询参数中包含 url 的情况
+        // 这里使用更贪婪的匹配来确保获取主 URL
+        const greedyMatch = actualUrlStr.match(/(https?:\/\/.+)/);
+        if (greedyMatch) {
+            actualUrlStr = greedyMatch[1];
+        }
     }
 
-    // 2.1 修正协议 (处理 https:/example.com 或 example.com)
+    // 2.1 修正无协议 URL (处理 /static/css/style.css)
     if (!actualUrlStr.startsWith("http")) {
-       // 尝试通过 Referer 还原
-       const referer = request.headers.get("Referer");
        let fixed = false;
+       
+       // 策略 A: 尝试通过 Referer 还原
+       const referer = request.headers.get("Referer");
        if (referer) {
          try {
            const refererObj = new URL(referer);
            if (refererObj.origin === url.origin) {
              const refererTarget = refererObj.pathname.slice(1);
-             // 再次检查 Referer 是否包含真正的 URL
+             // 提取 Referer 中的真实 URL
              const refMatch = refererTarget.match(/(https?:\/\/.+)/);
-             const baseStr = refMatch ? refMatch[1] : refererTarget;
-             
-             if (baseStr.startsWith("http")) {
+             if (refMatch) {
+                const baseStr = refMatch[1];
                 const targetBase = new URL(baseStr);
-                // 解决相对路径 ../v1/api
+                // 使用 Referer 作为 Base 解析相对路径
                 actualUrlStr = new URL(actualUrlStr, targetBase.href).href;
                 fixed = true;
              }
            }
          } catch(e) {}
        }
-       // 如果 Referer 没救回来，默认加 https
+       
+       // 策略 B: 尝试通过 Cookie 还原 (这是解决 404 的关键)
+       // 如果 Referer 失败（如直接请求或被跨域策略拦截），读取上次成功访问的域名
+       if (!fixed) {
+           const cookies = request.headers.get("Cookie") || "";
+           const targetCookie = cookies.match(/__proxy_target__=([^;]+)/);
+           if (targetCookie) {
+               try {
+                   const baseOrigin = decodeURIComponent(targetCookie[1]);
+                   // 拼接 baseOrigin 和当前路径
+                   // 注意 actualUrlStr 可能以 / 开头，也可能不
+                   const baseObj = new URL(baseOrigin);
+                   actualUrlStr = new URL(actualUrlStr, baseObj.href).href;
+                   fixed = true;
+               } catch(e) {}
+           }
+       }
+
+       // 策略 C: 兜底处理
        if (!fixed) {
            if (actualUrlStr.includes(".") && !actualUrlStr.startsWith("/")) {
                actualUrlStr = "https://" + actualUrlStr;
            } else {
-               // 最后的兜底，尝试修复畸形的 protocol
-               actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
+               // 无法解析，返回 404，避免错误的 Fetch
+               return new Response(`Cannot resolve URL: ${actualUrlStr}`, { status: 404 });
            }
        }
     }
@@ -99,13 +122,6 @@ export default {
     // 4. 准备代理请求
     let targetUrl;
     try {
-      // 再次清洗，确保没有双重 protocol
-      const doubleCheck = actualUrlStr.match(/(https?:\/\/.+)/);
-      if (doubleCheck) actualUrlStr = doubleCheck[1];
-
-      if (!actualUrlStr.startsWith("http")) {
-          return new Response("Invalid URL: " + actualUrlStr, { status: 404 });
-      }
       targetUrl = new URL(actualUrlStr);
     } catch (e) {
       return new Response("URL Parse Error: " + e.message, { status: 400 });
@@ -118,13 +134,10 @@ export default {
       newHeaders.set(key, value);
     }
 
-    // 伪装 Host
+    // 伪装 Host 和 Origin
     newHeaders.set("Host", targetUrl.host);
-    
-    // Origin: GET 请求通常不发 Origin，只有 POST/PUT 等需要
-    // 发送错误的 Origin 可能导致 403
     if (["GET", "HEAD"].includes(request.method)) {
-        newHeaders.delete("Origin"); 
+        newHeaders.delete("Origin"); // GET 不发 Origin，防止 403
     } else {
         newHeaders.set("Origin", targetUrl.origin);
     }
@@ -132,17 +145,15 @@ export default {
     newHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
     // 智能 Referer 处理
-    const clientReferer = request.headers.get("Referer");
-    // 默认 Referer 为目标首页，这是最安全的
+    // 默认 Referer 设置为目标根域名，通过大多数防盗链检测
     let newReferer = targetUrl.origin + "/";
-    
-    // 如果请求的是同一站点的资源，尝试构建更精确的 Referer
+    const clientReferer = request.headers.get("Referer");
     if (clientReferer && clientReferer.startsWith(url.origin)) {
+        // 如果客户端 Referer 是代理过的，尝试提取出原始 URL
         const realRefererPart = clientReferer.slice(url.origin.length + 1);
-        const refProtocolMatch = realRefererPart.match(/(https?:\/\/.+)/);
-        if (refProtocolMatch) {
-             // 如果上一页是 HTML，使用上一页的完整 URL 作为 Referer
-             newReferer = refProtocolMatch[1];
+        const refMatch = realRefererPart.match(/(https?:\/\/.+)/);
+        if (refMatch) {
+             newReferer = refMatch[1];
         }
     }
     newHeaders.set("Referer", newReferer);
@@ -168,37 +179,39 @@ export default {
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
 
-    // 6.1 Cookie 修复 
-    // 移除 Domain，强制 Path=/, 添加 SameSite=None; Secure 以支持跨域
-    const setCookie = responseHeaders.get("Set-Cookie");
-    if (setCookie) {
-        const newCookie = setCookie
-            .replace(/Domain=[^;]+;?/gi, "")
-            .replace(/Path=[^;]+;?/gi, "") + "; Path=/; SameSite=None; Secure";
-        responseHeaders.set("Set-Cookie", newCookie);
+    // Cookie 修复：记录当前目标域名，供后续 404 资源使用
+    const contentType = responseHeaders.get("Content-Type") || "";
+    if (contentType.includes("text/html")) {
+        // 设置一个 HttpOnly 的 Cookie 记录目标 Origin
+        responseHeaders.append("Set-Cookie", `__proxy_target__=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=None; Secure; HttpOnly`);
     }
-    // 兼容新版 Workers API
+
+    // 处理原站 Set-Cookie
     if (typeof responseHeaders.getSetCookie === 'function') {
          const cookies = responseHeaders.getSetCookie();
          responseHeaders.delete("Set-Cookie");
          cookies.forEach(c => {
+             // 移除 Domain 和 Path 限制，强制 SameSite=None
              let cleanCookie = c.replace(/Domain=[^;]+;?/gi, "").replace(/Path=[^;]+;?/gi, "");
              cleanCookie += "; Path=/; SameSite=None; Secure";
              responseHeaders.append("Set-Cookie", cleanCookie);
          });
+    } else {
+        const setCookie = responseHeaders.get("Set-Cookie");
+        if (setCookie) {
+            const newCookie = setCookie.replace(/Domain=[^;]+;?/gi, "").replace(/Path=[^;]+;?/gi, "") + "; Path=/; SameSite=None; Secure";
+            responseHeaders.set("Set-Cookie", newCookie);
+        }
     }
 
-    // 6.2 重定向 Location 修复
+    // Location 重定向修复
     const location = responseHeaders.get("Location");
     if (location) {
       try {
-        // 处理相对路径重定向
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
       } catch (e) {}
     }
-
-    const contentType = responseHeaders.get("Content-Type") || "";
 
     // 7. 内容重写
     
@@ -210,7 +223,6 @@ export default {
             match = match.trim();
             if (!match) return match;
             try {
-                // 解决相对路径
                 const absUrl = match.startsWith("http") ? match : new URL(match, baseUrl).href;
                 return url.origin + "/" + absUrl;
             } catch (e) { return match; }
@@ -223,26 +235,26 @@ export default {
       const rewriter = new HTMLRewriter()
         .on("head", {
           element(element) {
+            // 移除 base 标签，防止相对路径错乱
+            // 注入增强版 Monkey Patch
             element.append(`
             <script>
               (function() {
                 const PROXY = window.location.origin;
-                // 保存当前页面的真实 URL，用于相对路径计算
                 const BASE = '${targetUrl.href}'; 
                 
                 function wrap(u) {
                     if (!u || typeof u !== 'string') return u;
-                    // 防止双重代理
-                    if (u.includes(PROXY)) return u;
+                    if (u.includes(PROXY)) return u; // 已代理
                     if (u.startsWith('data:') || u.startsWith('javascript:') || u.startsWith('#')) return u;
                     if (!u.trim()) return u;
                     
                     try { 
-                        // 处理 //example.com
+                        // 处理协议相对路径 //example.com
                         if (u.startsWith('//')) return PROXY + '/https:' + u;
-                        // 处理绝对路径 /api
+                        // 处理绝对路径 /assets/js
                         if (u.startsWith('/')) return PROXY + '/' + new URL(u, BASE).origin + u;
-                        // 处理 http
+                        // 处理 http/https 开头
                         if (u.startsWith('http')) return PROXY + '/' + u;
                         // 处理相对路径
                         return PROXY + '/' + new URL(u, BASE).href; 
@@ -262,32 +274,29 @@ export default {
                     return _open.call(this, m, wrap(u), ...a);
                 };
 
-                // 3. 彻底杀死 Service Worker
+                // 3. 劫持 setAttribute (解决动态 CSS/JS 加载问题)
+                const _setAttribute = Element.prototype.setAttribute;
+                Element.prototype.setAttribute = function(name, value) {
+                    if (['src', 'href', 'action', 'data'].includes(name.toLowerCase())) {
+                        return _setAttribute.call(this, name, wrap(value));
+                    }
+                    return _setAttribute.call(this, name, value);
+                };
+
+                // 4. 杀死 Service Worker
                 if (navigator.serviceWorker) {
-                    navigator.serviceWorker.getRegistrations().then(function(registrations) {
-                        for(let registration of registrations) {
-                            registration.unregister();
-                        }
-                    });
-                    // 覆盖 register 方法，使其失效
-                    navigator.serviceWorker.register = function() {
-                        return new Promise(function(resolve, reject) {
-                            // 返回一个假的 promise，什么都不做
-                            console.log('SW Registration blocked by proxy');
-                        });
-                    };
+                     navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+                     navigator.serviceWorker.register = () => new Promise(() => {});
                 }
 
-                // 4. 劫持 DOM 属性赋值
+                // 5. 劫持 DOM 属性赋值 (img.src = ...)
                 const tags = {
                     'img': 'src', 'script': 'src', 'link': 'href', 'a': 'href',
                     'iframe': 'src', 'video': 'src', 'audio': 'src', 'source': 'src', 'form': 'action'
                 };
-                
                 for (const [tag, attr] of Object.entries(tags)) {
                     const elProto = window[tag.toUpperCase() + 'Element'] || window['HTML' + tag.charAt(0).toUpperCase() + tag.slice(1) + 'Element'];
                     if (!elProto) continue;
-                    
                     const desc = Object.getOwnPropertyDescriptor(elProto.prototype, attr);
                     if (desc && desc.set) {
                         Object.defineProperty(elProto.prototype, attr, {
@@ -295,9 +304,7 @@ export default {
                                 if(v) { desc.set.call(this, wrap(v)); } 
                                 else { desc.set.call(this, v); }
                             },
-                            get: desc.get, 
-                            enumerable: true, 
-                            configurable: true
+                            get: desc.get, enumerable: true, configurable: true
                         });
                     }
                 }
@@ -305,6 +312,7 @@ export default {
             </script>`, { html: true });
           }
         })
+        .on("base", { element(el) { el.remove(); } }) // 移除 Base 标签
         .on("a", new AttributeRewriter("href", url.origin, targetUrl.href))
         .on("img", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("form", new AttributeRewriter("action", url.origin, targetUrl.href))
@@ -340,7 +348,6 @@ class AttributeRewriter {
     const v = el.getAttribute(this.attr);
     if (v && !v.startsWith("data:") && !v.startsWith("javascript:") && !v.startsWith("#")) {
         try { 
-            // 解决 HTML 中已经是绝对路径的情况
             if (v.startsWith("http")) {
                 el.setAttribute(this.attr, this.proxy + "/" + v);
             } else {
