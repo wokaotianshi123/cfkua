@@ -34,6 +34,22 @@ export default {
     // 2. 解析目标 URL
     let actualUrlStr = url.pathname.slice(1) + url.search + url.hash;
 
+    // --- 核心修复：Service Worker 拦截 ---
+    // 防止目标网站的 sw.js 接管页面导致 404 或缓存错误
+    if (actualUrlStr.includes("service-worker") || actualUrlStr.includes("sw.js") || actualUrlStr.includes("worker.js")) {
+        return new Response("/* Proxy: Service Worker Disabled */ self.addEventListener('install', () => self.skipWaiting());", {
+            headers: { "Content-Type": "application/javascript" }
+        });
+    }
+
+    // --- 核心修复：URL 清洗 ---
+    // 解决 "zh/https://..." 这种重复拼接的问题
+    // 如果路径中包含 http/https，提取它及其之后的部分
+    const protocolMatch = actualUrlStr.match(/(https?:\/\/.+)/);
+    if (protocolMatch) {
+        actualUrlStr = protocolMatch[1];
+    }
+
     // 2.1 修正协议 (处理 https:/example.com 或 example.com)
     if (!actualUrlStr.startsWith("http")) {
        // 尝试通过 Referer 还原
@@ -44,8 +60,12 @@ export default {
            const refererObj = new URL(referer);
            if (refererObj.origin === url.origin) {
              const refererTarget = refererObj.pathname.slice(1);
-             if (refererTarget.startsWith("http")) {
-                const targetBase = new URL(refererTarget);
+             // 再次检查 Referer 是否包含真正的 URL
+             const refMatch = refererTarget.match(/(https?:\/\/.+)/);
+             const baseStr = refMatch ? refMatch[1] : refererTarget;
+             
+             if (baseStr.startsWith("http")) {
+                const targetBase = new URL(baseStr);
                 // 解决相对路径 ../v1/api
                 actualUrlStr = new URL(actualUrlStr, targetBase.href).href;
                 fixed = true;
@@ -58,6 +78,7 @@ export default {
            if (actualUrlStr.includes(".") && !actualUrlStr.startsWith("/")) {
                actualUrlStr = "https://" + actualUrlStr;
            } else {
+               // 最后的兜底，尝试修复畸形的 protocol
                actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
            }
        }
@@ -78,8 +99,12 @@ export default {
     // 4. 准备代理请求
     let targetUrl;
     try {
+      // 再次清洗，确保没有双重 protocol
+      const doubleCheck = actualUrlStr.match(/(https?:\/\/.+)/);
+      if (doubleCheck) actualUrlStr = doubleCheck[1];
+
       if (!actualUrlStr.startsWith("http")) {
-          return new Response("Invalid URL", { status: 404 });
+          return new Response("Invalid URL: " + actualUrlStr, { status: 404 });
       }
       targetUrl = new URL(actualUrlStr);
     } catch (e) {
@@ -107,26 +132,20 @@ export default {
     newHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
     // 智能 Referer 处理
-    // 很多视频站防盗链策略：要求 Referer 必须是其域名下的页面
-    // 我们强制将 Referer 设置为目标网站的 Origin + Path (如果是 HTML) 或者 Origin (如果是资源)
     const clientReferer = request.headers.get("Referer");
+    // 默认 Referer 为目标首页，这是最安全的
+    let newReferer = targetUrl.origin + "/";
+    
+    // 如果请求的是同一站点的资源，尝试构建更精确的 Referer
     if (clientReferer && clientReferer.startsWith(url.origin)) {
         const realRefererPart = clientReferer.slice(url.origin.length + 1);
-        if (realRefererPart.startsWith("http")) {
-             // 如果是 HTML 页面请求，保留完整路径作为 Referer
-             // 如果是资源请求 (js, css, img, ts)，通常只发送 Origin 即可，兼容性更好
-             const ext = targetUrl.pathname.split('.').pop().toLowerCase();
-             if (["js", "css", "jpg", "jpeg", "png", "gif", "ts", "m4s", "mp4"].includes(ext)) {
-                 newHeaders.set("Referer", targetUrl.origin + "/");
-             } else {
-                 newHeaders.set("Referer", realRefererPart);
-             }
-        } else {
-             newHeaders.set("Referer", targetUrl.origin + "/");
+        const refProtocolMatch = realRefererPart.match(/(https?:\/\/.+)/);
+        if (refProtocolMatch) {
+             // 如果上一页是 HTML，使用上一页的完整 URL 作为 Referer
+             newReferer = refProtocolMatch[1];
         }
-    } else {
-        newHeaders.set("Referer", targetUrl.origin + "/");
     }
+    newHeaders.set("Referer", newReferer);
 
     // 5. 发起请求
     let response;
@@ -173,6 +192,7 @@ export default {
     const location = responseHeaders.get("Location");
     if (location) {
       try {
+        // 处理相对路径重定向
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
       } catch (e) {}
@@ -212,8 +232,9 @@ export default {
                 
                 function wrap(u) {
                     if (!u || typeof u !== 'string') return u;
-                    if (u.startsWith(PROXY) || u.startsWith('data:') || u.startsWith('javascript:') || u.startsWith('#')) return u;
-                    // 忽略纯粹的 hash 或空
+                    // 防止双重代理
+                    if (u.includes(PROXY)) return u;
+                    if (u.startsWith('data:') || u.startsWith('javascript:') || u.startsWith('#')) return u;
                     if (!u.trim()) return u;
                     
                     try { 
@@ -232,10 +253,6 @@ export default {
                 const _fetch = window.fetch;
                 window.fetch = function(input, init) {
                     if (typeof input === 'string') input = wrap(input);
-                    else if (input instanceof Request) {
-                        // 如果是 Request 对象，难以直接修改 url (只读)，只能新建
-                        // 这里简化处理，大多数情况 input 是 string
-                    }
                     return _fetch(input, init);
                 };
                 
@@ -245,7 +262,23 @@ export default {
                     return _open.call(this, m, wrap(u), ...a);
                 };
 
-                // 3. 劫持 DOM 属性赋值 (核心：解决 js 动态拼接)
+                // 3. 彻底杀死 Service Worker
+                if (navigator.serviceWorker) {
+                    navigator.serviceWorker.getRegistrations().then(function(registrations) {
+                        for(let registration of registrations) {
+                            registration.unregister();
+                        }
+                    });
+                    // 覆盖 register 方法，使其失效
+                    navigator.serviceWorker.register = function() {
+                        return new Promise(function(resolve, reject) {
+                            // 返回一个假的 promise，什么都不做
+                            console.log('SW Registration blocked by proxy');
+                        });
+                    };
+                }
+
+                // 4. 劫持 DOM 属性赋值
                 const tags = {
                     'img': 'src', 'script': 'src', 'link': 'href', 'a': 'href',
                     'iframe': 'src', 'video': 'src', 'audio': 'src', 'source': 'src', 'form': 'action'
@@ -259,24 +292,14 @@ export default {
                     if (desc && desc.set) {
                         Object.defineProperty(elProto.prototype, attr, {
                             set: function(v) { 
-                                // 只有当赋值非空时才重写
-                                if(v) {
-                                   desc.set.call(this, wrap(v)); 
-                                } else {
-                                   desc.set.call(this, v);
-                                }
+                                if(v) { desc.set.call(this, wrap(v)); } 
+                                else { desc.set.call(this, v); }
                             },
                             get: desc.get, 
                             enumerable: true, 
                             configurable: true
                         });
                     }
-                }
-                
-                // 4. 禁用 ServiceWorker (防止 sw 接管请求导致 404/跨域)
-                if(navigator.serviceWorker) {
-                    navigator.serviceWorker.register = () => new Promise(()=>{});
-                    navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
                 }
               })();
             </script>`, { html: true });
@@ -328,7 +351,6 @@ class AttributeRewriter {
     if (el.tagName === "img" && el.hasAttribute("srcset")) {
         try {
             const val = el.getAttribute("srcset");
-            // 简单粗暴替换 http -> proxy/http
             el.setAttribute("srcset", val.replace(/(https?:\/\/)/g, this.proxy + "/$1"));
         } catch(e) {}
     }
