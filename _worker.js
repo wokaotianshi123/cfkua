@@ -35,10 +35,17 @@ export default {
         try {
           const refererObj = new URL(referer);
           if (refererObj.origin === url.origin) {
-            const refererTargetStr = refererObj.pathname.slice(1) + refererObj.search;
+            let refererTargetStr = refererObj.pathname.slice(1) + refererObj.search;
+            // 同样修正 Referer 中的协议格式
+            if (refererTargetStr.startsWith("http") && !refererTargetStr.startsWith("http://") && !refererTargetStr.startsWith("https://")) {
+                refererTargetStr = refererTargetStr.replace(/^(https?):\/+/, "$1://");
+            }
+
             if (refererTargetStr.startsWith("http")) {
                 const targetBase = new URL(refererTargetStr);
-                actualUrlStr = new URL(actualUrlStr, targetBase.href).href;
+                // 使用 url.pathname (带 /) 而不是 actualUrlStr (不带 /)
+                // 这样 new URL('/path', base) 会正确解析为 root-relative，而不是 path-relative
+                actualUrlStr = new URL(url.pathname + url.search + url.hash, targetBase.href).href;
             }
           }
         } catch (e) {}
@@ -71,8 +78,6 @@ export default {
     const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(request.method);
 
     // 复制原请求头，但过滤掉 CF 特定头、Cookie 和 Security 头
-    // 过滤 Cookie 是为了避免 403 错误（域名不匹配的 Cookie 会导致服务器拒绝）
-    // 过滤 Sec- 头是为了避免 WAF 检测到上下文不一致
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
       if (lowerKey.startsWith("cf-") || 
@@ -91,14 +96,12 @@ export default {
     // 关键：伪造 Host
     newHeaders.set("Host", targetUrl.host);
     
-    // 只有在非 GET 请求时才发送 Origin，避免触发 WAF
+    // 只有在非 GET 请求时才发送 Origin
     if (!isSafeMethod) {
         newHeaders.set("Origin", targetUrl.origin);
     }
     
     // 智能 Referer 处理
-    // 1. 如果是页面内的子资源请求（Referer 指向代理站），则还原真实 Referer
-    // 2. 如果是主页面导航（无 Referer），则不发送 Referer（模仿直接访问），而不强制发送 self-referer
     const clientReferer = request.headers.get("Referer");
     if (clientReferer && clientReferer.startsWith(url.origin)) {
         const realRefererPart = clientReferer.slice(url.origin.length + 1);
@@ -106,9 +109,6 @@ export default {
              newHeaders.set("Referer", realRefererPart);
         }
     } 
-    // 注意：如果 clientReferer 为空（直接访问），我们不设置 Referer。
-    // 这比强制设置为 targetUrl.href 更安全，因为许多 WAF 会拦截 Referer 与 Host 相同的"可疑"请求，或者反爬虫策略会检测 Referer。
-    // 对于视频流 (.m3u8/.ts)，浏览器会自动发送 Referer，进入上面的 if 分支，从而正确伪造 Referer。
 
     // 5. 发起请求
     let response;
