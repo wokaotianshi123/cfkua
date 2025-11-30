@@ -198,11 +198,33 @@ export default {
                     }
                 }
 
-                const elementProtos = [window.HTMLAnchorElement, window.HTMLImageElement, window.HTMLLinkElement, window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLSourceElement, window.HTMLVideoElement, window.HTMLAudioElement];
+                // 1. 劫持 History API (pushState, replaceState) 防止 SPA 移除代理前缀
+                const oldPushState = history.pushState;
+                const oldReplaceState = history.replaceState;
+                
+                function wrapHistoryArgs(args) {
+                    // args: [state, title, url]
+                    if (args.length >= 3 && typeof args[2] === 'string') {
+                        args[2] = wrapUrl(args[2]);
+                    }
+                    return args;
+                }
+
+                history.pushState = function(...args) {
+                    return oldPushState.apply(this, wrapHistoryArgs(args));
+                };
+                history.replaceState = function(...args) {
+                    return oldReplaceState.apply(this, wrapHistoryArgs(args));
+                };
+
+                // 2. 劫持原生属性赋值
+                const elementProtos = [window.HTMLAnchorElement, window.HTMLImageElement, window.HTMLLinkElement, window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLSourceElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLFormElement];
                 elementProtos.forEach(Proto => {
                     if (!Proto) return;
                     const proto = Proto.prototype;
-                    const attrName = (Proto === window.HTMLAnchorElement || Proto === window.HTMLLinkElement) ? 'href' : 'src';
+                    const attrName = (Proto === window.HTMLAnchorElement || Proto === window.HTMLLinkElement || Proto === window.HTMLBaseElement) ? 'href' : 
+                                     (Proto === window.HTMLFormElement) ? 'action' : 'src';
+                    
                     const descriptor = Object.getOwnPropertyDescriptor(proto, attrName);
                     if (descriptor && descriptor.set) {
                         const originalSet = descriptor.set;
@@ -218,6 +240,7 @@ export default {
                     }
                 });
 
+                // 3. 劫持 fetch
                 const oldFetch = window.fetch;
                 window.fetch = function(input, init) {
                     let url = input;
@@ -227,11 +250,13 @@ export default {
                     return oldFetch(url, init);
                 };
 
+                // 4. 劫持 XHR
                 const oldOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(method, url, ...args) {
                     return oldOpen.call(this, method, wrapUrl(url), ...args);
                 };
 
+                // 5. 禁用 ServiceWorker
                 if (navigator.serviceWorker) {
                     navigator.serviceWorker.register = () => new Promise(() => {});
                     navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
@@ -249,7 +274,28 @@ export default {
         .on("video", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("audio", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("source", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("object", new AttributeRewriter("data", url.origin, targetUrl.href));
+        .on("object", new AttributeRewriter("data", url.origin, targetUrl.href))
+        .on("base", new AttributeRewriter("href", url.origin, targetUrl.href))
+        .on("meta", {
+            element(element) {
+                const httpEquiv = element.getAttribute("http-equiv");
+                if (httpEquiv && httpEquiv.toLowerCase() === "refresh") {
+                    let content = element.getAttribute("content");
+                    if (content) {
+                        const match = content.match(/url\s*=\s*['"]?([^'";]+)['"]?/i);
+                        if (match && match[1]) {
+                             const originalUrl = match[1];
+                             try {
+                                 const absoluteUrl = new URL(originalUrl, targetUrl.href).href;
+                                 const newUrl = url.origin + "/" + absoluteUrl;
+                                 const newContent = content.replace(originalUrl, newUrl);
+                                 element.setAttribute("content", newContent);
+                             } catch(e) {}
+                        }
+                    }
+                }
+            }
+        });
 
       return rewriter.transform(new Response(response.body, {
         status: response.status,
