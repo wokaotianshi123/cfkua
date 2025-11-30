@@ -1,3 +1,4 @@
+
 // _worker.js
 
 // 想要移除的响应头 (解决 CSP, Frame 限制等问题)
@@ -47,7 +48,7 @@ export default {
       if (/^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/.test(actualUrlStr)) {
          actualUrlStr = "https://" + actualUrlStr;
       } else {
-         // 无法解析的 URL，直接返回 404 或让 fetch 抛出错误
+         // 无法解析的 URL，视作无效
       }
     }
 
@@ -77,10 +78,28 @@ export default {
       newHeaders.set(key, value);
     }
 
-    // 关键：伪造 Host, Origin, Referer，欺骗目标服务器
+    // 关键：伪造 Host, Origin
     newHeaders.set("Host", targetUrl.host);
     newHeaders.set("Origin", targetUrl.origin);
-    newHeaders.set("Referer", targetUrl.href);
+
+    // 智能处理 Referer：避免直接使用代理地址作为 Referer，而是还原真实的 Referer
+    const clientReferer = request.headers.get("Referer");
+    if (clientReferer && clientReferer.startsWith(url.origin)) {
+      try {
+        const realReferer = clientReferer.slice(url.origin.length + 1);
+        // 只有当解析出的 Referer 是合法 URL 时才使用，否则使用目标 URL
+        if (realReferer.startsWith("http")) {
+           newHeaders.set("Referer", realReferer);
+        } else {
+           newHeaders.set("Referer", targetUrl.href);
+        }
+      } catch (e) {
+        newHeaders.set("Referer", targetUrl.href);
+      }
+    } else {
+      // 默认 Fallback
+      newHeaders.set("Referer", targetUrl.href);
+    }
 
     // 5. 发起请求
     let response;
@@ -110,6 +129,7 @@ export default {
     const location = responseHeaders.get("Location");
     if (location) {
       try {
+        // 将重定向的目标地址也包裹在代理中
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
       } catch (e) {}
@@ -127,23 +147,21 @@ export default {
 
     const contentType = responseHeaders.get("Content-Type") || "";
 
-    // 7. 处理 HTML 内容 (注入脚本 + 重写链接)
+    // 7. 处理内容响应
+    // A. HTML 内容 (注入脚本 + 重写链接)
     if (contentType.includes("text/html")) {
       const rewriter = new HTMLRewriter()
         .on("head", {
           element(element) {
-            // 注入客户端脚本：禁用 ServiceWorker，劫持 fetch/xhr
+            // 注入客户端脚本：禁用 ServiceWorker，劫持 fetch/xhr，监听 DOM 变化
             element.append(`
             <script>
               (function() {
                 const PROXY_ORIGIN = window.location.origin;
                 
-                // 1. 禁用 Service Worker (解决 YouTube 等网站的 sw.js 报错)
+                // 1. 禁用 Service Worker
                 if (navigator.serviceWorker) {
-                    navigator.serviceWorker.register = function() { 
-                        console.log('SW registration blocked by proxy');
-                        return new Promise(() => {}); 
-                    };
+                    navigator.serviceWorker.register = function() { return new Promise(() => {}); };
                     navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
                 }
 
@@ -152,7 +170,6 @@ export default {
                 window.fetch = function(input, init) {
                     let url = input;
                     if (typeof input === 'string') {
-                        // 如果是绝对路径且不是代理域名，强制走代理
                         if (input.startsWith('http') && !input.startsWith(PROXY_ORIGIN)) {
                             url = PROXY_ORIGIN + '/' + input;
                         } else if (input.startsWith('//')) {
@@ -174,6 +191,44 @@ export default {
                     }
                     return oldOpen.call(this, method, url, ...args);
                 };
+
+                // 4. MutationObserver 监听动态插入的标签 (解决动态视频地址)
+                const observer = new MutationObserver(mutations => {
+                    mutations.forEach(mutation => {
+                        mutation.addedNodes.forEach(node => {
+                            if (node.nodeType === 1) { 
+                                if (['VIDEO', 'AUDIO', 'SOURCE', 'IFRAME', 'IMG'].includes(node.tagName)) {
+                                    rewriteAttribute(node);
+                                }
+                                if (node.querySelectorAll) {
+                                    node.querySelectorAll('video, audio, source, iframe, img').forEach(rewriteAttribute);
+                                }
+                            }
+                        });
+                        if (mutation.type === 'attributes' && ['src', 'href'].includes(mutation.attributeName)) {
+                            rewriteAttribute(mutation.target);
+                        }
+                    });
+                });
+                
+                function rewriteAttribute(node) {
+                    const attr = (node.tagName === 'LINK' || node.tagName === 'A') ? 'href' : 'src';
+                    let val = node.getAttribute(attr);
+                    // 只处理绝对路径，避免循环引用
+                    if (val && val.startsWith('http') && !val.startsWith(PROXY_ORIGIN)) {
+                        node.setAttribute(attr, PROXY_ORIGIN + '/' + val);
+                    } else if (val && val.startsWith('//')) {
+                        node.setAttribute(attr, PROXY_ORIGIN + '/https:' + val);
+                    }
+                }
+
+                observer.observe(document.documentElement, {
+                    childList: true,
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['src', 'href']
+                });
+
               })();
             </script>`, { html: true });
           }
@@ -195,8 +250,23 @@ export default {
         headers: responseHeaders
       }));
     }
+    
+    // B. M3U8 视频流 (重写其中的绝对链接)
+    if (contentType.includes("application/vnd.apple.mpegurl") || contentType.includes("application/x-mpegurl")) {
+        const text = await response.text();
+        // 匹配 http:// 或 https:// 开头的行，并在前面加上代理前缀
+        const newText = text.replace(/(https?:\/\/[^\s]+)/g, (match) => {
+            if (match.startsWith(url.origin)) return match;
+            return url.origin + "/" + match;
+        });
+        return new Response(newText, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: responseHeaders
+        });
+    }
 
-    // 非 HTML 内容直接返回
+    // C. 其他内容直接透传
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -206,7 +276,7 @@ export default {
 };
 
 /**
- * HTMLRewriter 处理类，用于重写 HTML 中的 URL 属性
+ * HTMLRewriter 处理类
  */
 class AttributeRewriter {
   constructor(attributeName, proxyOrigin, currentTargetUrl) {
@@ -218,18 +288,13 @@ class AttributeRewriter {
   element(element) {
     const value = element.getAttribute(this.attributeName);
     if (value) {
-      // 跳过特殊协议
       if (value.startsWith("data:") || value.startsWith("#") || value.startsWith("mailto:") || value.startsWith("javascript:")) return;
-      
       try {
-        // 计算绝对路径
         const resolvedUrl = new URL(value, this.currentTargetUrl).href;
-        // 加上代理前缀
         element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
       } catch (e) {}
     }
     
-    // 特殊处理 srcset
     if (element.tagName === "img" && element.hasAttribute("srcset")) {
         const srcset = element.getAttribute("srcset");
         const newSrcset = srcset.split(",").map(part => {
