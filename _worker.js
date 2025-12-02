@@ -77,21 +77,19 @@ export default {
     const newHeaders = new Headers();
     const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(request.method);
 
-    // 复制原请求头
-    // 关键修改：保留 Cookie 和 UA，这对通过 Cloudflare 验证至关重要
-    // 仅过滤 cf- 开头的内部头，防止冲突
+    // 复制原请求头，但过滤掉 CF 特定头、Cookie 和 Security 头
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
-      // 过滤 cf- 头以避免被目标站点的 Cloudflare 识别为循环或错误
-      if (lowerKey.startsWith("cf-")) {
+      if (lowerKey.startsWith("cf-") || 
+          lowerKey.startsWith("sec-") || 
+          lowerKey === "cookie") {
         continue;
       }
-      // 注意：不再过滤 "cookie" 和 "sec-" 头
       newHeaders.set(key, value);
     }
 
-    // 确保 User-Agent 存在 (如果客户端没发，则补一个)
-    if (!newHeaders.has("user-agent")) {
+    // 确保 User-Agent 存在
+    if (!newHeaders.has("User-Agent")) {
         newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
     }
 
@@ -110,13 +108,7 @@ export default {
         if (realRefererPart.startsWith("http")) {
              newHeaders.set("Referer", realRefererPart);
         }
-    } else if (!newHeaders.has("Referer")) {
-        // 如果没有 Referer，或者 Referer 不是本站发起的，通常设为 target origin 或留空
-        // 为了兼容性，有时设置为 targetUrl.href 更好，但有时会暴露。
-        // 这里保持稍微保守的策略：如果客户端有 Referer 且不是本代理的，可能直接透传了（在上面的循环中）
-        // 如果要伪造 Referer 为目标站内部跳转：
-        newHeaders.set("Referer", targetUrl.href);
-    }
+    } 
 
     // 5. 发起请求
     let response;
@@ -143,8 +135,6 @@ export default {
     const location = responseHeaders.get("Location");
     if (location) {
       try {
-        //如果是相对路径，基于 targetUrl 拼接
-        //如果是绝对路径，直接拼接代理前缀
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
       } catch (e) {}
