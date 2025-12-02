@@ -1,7 +1,8 @@
+
 // _worker.js
 
 // 想要移除的响应头 (解决 CSP, Frame 限制等问题)
-const UNSAFE_HEADERS = new Set([
+const UNSAFE_RESPONSE_HEADERS = new Set([
   "content-security-policy",
   "content-security-policy-report-only",
   "x-frame-options",
@@ -43,8 +44,6 @@ export default {
 
             if (refererTargetStr.startsWith("http")) {
                 const targetBase = new URL(refererTargetStr);
-                // 使用 url.pathname (带 /) 而不是 actualUrlStr (不带 /)
-                // 这样 new URL('/path', base) 会正确解析为 root-relative，而不是 path-relative
                 actualUrlStr = new URL(url.pathname + url.search + url.hash, targetBase.href).href;
             }
           }
@@ -58,7 +57,8 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-          "Access-Control-Allow-Headers": "*"
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Credentials": "true"
         }
       });
     }
@@ -67,6 +67,8 @@ export default {
     let targetUrl;
     try {
       if (!actualUrlStr.startsWith("http")) {
+          // 如果解析失败，尝试作为相对路径处理（假设目标是上一次访问的 host）
+          // 这里简单处理：如果实在解析不出，报错
           return new Response("Invalid URL (No Protocol): " + actualUrlStr, { status: 400 });
       }
       targetUrl = new URL(actualUrlStr);
@@ -77,38 +79,49 @@ export default {
     const newHeaders = new Headers();
     const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(request.method);
 
-    // 复制原请求头，但过滤掉 CF 特定头、Cookie 和 Security 头
+    // -----------------------------------------------------------
+    // 关键修复 1: Header 处理逻辑增强
+    // -----------------------------------------------------------
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
-      if (lowerKey.startsWith("cf-") || 
-          lowerKey.startsWith("sec-") || 
-          lowerKey === "cookie") {
-        continue;
-      }
+      // 过滤掉 CF 特定头
+      if (lowerKey.startsWith("cf-")) continue;
+      
+      // 修复：允许 Cookie 通过！很多网站依靠 Cookie 验证身份或 Session
+      // 仅过滤掉 host, referer, origin, sec- 等由我们手动构建的头
+      if (["host", "referer", "origin"].includes(lowerKey)) continue;
+
       newHeaders.set(key, value);
     }
 
-    // 确保 User-Agent 存在
+    // -----------------------------------------------------------
+    // 关键修复 2: 伪造身份 (Anti-Hotlink / Bot Detection Bypass)
+    // -----------------------------------------------------------
+    
+    // 强制 Host
+    newHeaders.set("Host", targetUrl.host);
+
+    // 强制伪造 Referer：告诉目标服务器，我就是从你的网站点过来的
+    // 视频网站通常检查 Referer 是否与视频文件同域
+    newHeaders.set("Referer", targetUrl.origin + "/"); 
+    
+    // 强制伪造 Origin (主要用于 POST 请求或 CORS 检查)
+    newHeaders.set("Origin", targetUrl.origin);
+
+    // 补全 User-Agent (防止某些服务器拒绝空 UA)
     if (!newHeaders.has("User-Agent")) {
-        newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
+        newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
     }
 
-    // 关键：伪造 Host
-    newHeaders.set("Host", targetUrl.host);
-    
-    // 只有在非 GET 请求时才发送 Origin
-    if (!isSafeMethod) {
-        newHeaders.set("Origin", targetUrl.origin);
+    // 添加一些浏览器标准头，让请求看起来更像真实浏览器
+    newHeaders.set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+    if (!newHeaders.has("Accept")) {
+        newHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
     }
-    
-    // 智能 Referer 处理
-    const clientReferer = request.headers.get("Referer");
-    if (clientReferer && clientReferer.startsWith(url.origin)) {
-        const realRefererPart = clientReferer.slice(url.origin.length + 1);
-        if (realRefererPart.startsWith("http")) {
-             newHeaders.set("Referer", realRefererPart);
-        }
-    } 
+
+    // 移除可能暴露代理身份的头 (X-Forwarded-For 由 CF Worker 自动处理，我们尽量减少额外痕迹)
+    newHeaders.delete("X-Forwarded-For");
+    newHeaders.delete("X-Real-IP");
 
     // 5. 发起请求
     let response;
@@ -117,7 +130,7 @@ export default {
         method: request.method,
         headers: newHeaders,
         body: request.body,
-        redirect: "manual"
+        redirect: "manual" // 手动处理重定向
       });
     } catch (e) {
       return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
@@ -125,18 +138,38 @@ export default {
 
     // 6. 处理响应头
     const responseHeaders = new Headers(response.headers);
-    UNSAFE_HEADERS.forEach(h => responseHeaders.delete(h));
+    UNSAFE_RESPONSE_HEADERS.forEach(h => responseHeaders.delete(h));
 
+    // 允许跨域，方便本地开发或由其他前端调用
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    
+    // 修复：确保 Set-Cookie 能正确传递回客户端
+    // 部分网站设置 Cookie 时指定了 Domain，浏览器可能会因为 Domain 不匹配当前代理域名而拒绝写入
+    // 我们简单粗暴地移除 Domain 属性，让 Cookie 写入当前代理域
+    const setCookie = responseHeaders.get("Set-Cookie");
+    if (setCookie) {
+        // 简单的替换逻辑，移除 Domain=xxx; 
+        const newCookie = setCookie.replace(/Domain=[^;]+;?/gi, "");
+        responseHeaders.set("Set-Cookie", newCookie);
+    }
 
     // 重写重定向 Location
     const location = responseHeaders.get("Location");
     if (location) {
       try {
+        // 处理相对路径重定向
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
+        
+        // 如果是 301/302/303/307/308，我们需要修改 Location，让浏览器跳回代理地址
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+            return new Response(null, {
+                status: response.status,
+                headers: responseHeaders
+            });
+        }
       } catch (e) {}
     }
 
@@ -144,7 +177,7 @@ export default {
 
     // 7. 内容处理
     
-    // A. M3U8 视频流
+    // A. M3U8 视频流 (常见于视频网站)
     if (contentType.includes("application/vnd.apple.mpegurl") || 
         contentType.includes("application/x-mpegurl") ||
         actualUrlStr.endsWith(".m3u8")) {
@@ -198,12 +231,11 @@ export default {
                     }
                 }
 
-                // 1. 劫持 History API (pushState, replaceState) 防止 SPA 移除代理前缀
+                // 劫持 History API
                 const oldPushState = history.pushState;
                 const oldReplaceState = history.replaceState;
                 
                 function wrapHistoryArgs(args) {
-                    // args: [state, title, url]
                     if (args.length >= 3 && typeof args[2] === 'string') {
                         args[2] = wrapUrl(args[2]);
                     }
@@ -217,30 +249,7 @@ export default {
                     return oldReplaceState.apply(this, wrapHistoryArgs(args));
                 };
 
-                // 2. 劫持原生属性赋值
-                const elementProtos = [window.HTMLAnchorElement, window.HTMLImageElement, window.HTMLLinkElement, window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLSourceElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLFormElement];
-                elementProtos.forEach(Proto => {
-                    if (!Proto) return;
-                    const proto = Proto.prototype;
-                    const attrName = (Proto === window.HTMLAnchorElement || Proto === window.HTMLLinkElement || Proto === window.HTMLBaseElement) ? 'href' : 
-                                     (Proto === window.HTMLFormElement) ? 'action' : 'src';
-                    
-                    const descriptor = Object.getOwnPropertyDescriptor(proto, attrName);
-                    if (descriptor && descriptor.set) {
-                        const originalSet = descriptor.set;
-                        Object.defineProperty(proto, attrName, {
-                            set: function(val) {
-                                const wrapped = wrapUrl(val);
-                                originalSet.call(this, wrapped);
-                            },
-                            get: descriptor.get,
-                            enumerable: true,
-                            configurable: true
-                        });
-                    }
-                });
-
-                // 3. 劫持 fetch
+                // 劫持 fetch
                 const oldFetch = window.fetch;
                 window.fetch = function(input, init) {
                     let url = input;
@@ -250,17 +259,11 @@ export default {
                     return oldFetch(url, init);
                 };
 
-                // 4. 劫持 XHR
+                // 劫持 XHR
                 const oldOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(method, url, ...args) {
                     return oldOpen.call(this, method, wrapUrl(url), ...args);
                 };
-
-                // 5. 禁用 ServiceWorker
-                if (navigator.serviceWorker) {
-                    navigator.serviceWorker.register = () => new Promise(() => {});
-                    navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
-                }
               })();
             </script>`, { html: true });
           }
@@ -271,31 +274,10 @@ export default {
         .on("script", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("form", new AttributeRewriter("action", url.origin, targetUrl.href))
         .on("iframe", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("video", new AttributeRewriter("src", url.origin, targetUrl.href))
+        .on("video", new AttributeRewriter("src", url.origin, targetUrl.href)) // 视频标签
         .on("audio", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("source", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("object", new AttributeRewriter("data", url.origin, targetUrl.href))
-        .on("base", new AttributeRewriter("href", url.origin, targetUrl.href))
-        .on("meta", {
-            element(element) {
-                const httpEquiv = element.getAttribute("http-equiv");
-                if (httpEquiv && httpEquiv.toLowerCase() === "refresh") {
-                    let content = element.getAttribute("content");
-                    if (content) {
-                        const match = content.match(/url\s*=\s*['"]?([^'";]+)['"]?/i);
-                        if (match && match[1]) {
-                             const originalUrl = match[1];
-                             try {
-                                 const absoluteUrl = new URL(originalUrl, targetUrl.href).href;
-                                 const newUrl = url.origin + "/" + absoluteUrl;
-                                 const newContent = content.replace(originalUrl, newUrl);
-                                 element.setAttribute("content", newContent);
-                             } catch(e) {}
-                        }
-                    }
-                }
-            }
-        });
+        .on("source", new AttributeRewriter("src", url.origin, targetUrl.href)) // source 标签
+        .on("track", new AttributeRewriter("src", url.origin, targetUrl.href));
 
       return rewriter.transform(new Response(response.body, {
         status: response.status,
@@ -304,6 +286,7 @@ export default {
       }));
     }
 
+    // 其他内容直接返回
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -328,6 +311,8 @@ class AttributeRewriter {
         element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
       } catch (e) {}
     }
+    
+    // 处理 srcset (图片响应式)
     if (element.tagName === "img" && element.hasAttribute("srcset")) {
         const srcset = element.getAttribute("srcset");
         const newSrcset = srcset.split(",").map(part => {
@@ -339,12 +324,25 @@ class AttributeRewriter {
         }).join(", ");
         element.setAttribute("srcset", newSrcset);
     }
+
+    // 处理 data-src (懒加载常见)
     const dataSrc = element.getAttribute("data-src");
     if (dataSrc) {
         try {
             const resolvedUrl = new URL(dataSrc, this.currentTargetUrl).href;
             element.setAttribute("data-src", this.proxyOrigin + "/" + resolvedUrl);
         } catch (e) {}
+    }
+    
+    // 处理 poster (视频封面)
+    if (element.tagName === "video") {
+        const poster = element.getAttribute("poster");
+        if (poster) {
+             try {
+                const resolvedUrl = new URL(poster, this.currentTargetUrl).href;
+                element.setAttribute("poster", this.proxyOrigin + "/" + resolvedUrl);
+            } catch (e) {}
+        }
     }
   }
 }
