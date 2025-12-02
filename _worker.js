@@ -67,8 +67,6 @@ export default {
     let targetUrl;
     try {
       if (!actualUrlStr.startsWith("http")) {
-          // 如果解析失败，尝试作为相对路径处理（假设目标是上一次访问的 host）
-          // 这里简单处理：如果实在解析不出，报错
           return new Response("Invalid URL (No Protocol): " + actualUrlStr, { status: 400 });
       }
       targetUrl = new URL(actualUrlStr);
@@ -77,51 +75,74 @@ export default {
     }
 
     const newHeaders = new Headers();
-    const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(request.method);
-
+    
     // -----------------------------------------------------------
-    // 关键修复 1: Header 处理逻辑增强
+    // Header 复制与清洗
     // -----------------------------------------------------------
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
-      // 过滤掉 CF 特定头
+      // 过滤 Cloudflare 头、Sec-Fetch 头（避免暴露来源不一致）、以及需要重写的头
       if (lowerKey.startsWith("cf-")) continue;
+      // 过滤 Sec-Fetch 头，防止目标服务器判断为 Cross-Site 而拦截
+      // 虽然 Fetch API 可能自动管理这些，但显式清理更安全
+      if (lowerKey.startsWith("sec-fetch-")) continue; 
       
-      // 修复：允许 Cookie 通过！很多网站依靠 Cookie 验证身份或 Session
-      // 仅过滤掉 host, referer, origin, sec- 等由我们手动构建的头
-      if (["host", "referer", "origin"].includes(lowerKey)) continue;
+      if (["host", "referer", "origin", "user-agent"].includes(lowerKey)) continue;
 
       newHeaders.set(key, value);
     }
 
     // -----------------------------------------------------------
-    // 关键修复 2: 伪造身份 (Anti-Hotlink / Bot Detection Bypass)
+    // 关键修复: 智能 Referer 与 Origin 伪造
     // -----------------------------------------------------------
     
-    // 强制 Host
+    // 1. Host
     newHeaders.set("Host", targetUrl.host);
 
-    // 强制伪造 Referer：告诉目标服务器，我就是从你的网站点过来的
-    // 视频网站通常检查 Referer 是否与视频文件同域
-    newHeaders.set("Referer", targetUrl.origin + "/"); 
+    // 2. Referer 处理
+    // 我们尝试从客户端的 Referer 中提取出原始目标的 URL 结构
+    const clientReferer = request.headers.get("Referer");
+    let upstreamReferer = "";
+
+    if (clientReferer && clientReferer.startsWith(url.origin)) {
+        // 如果 Referer 是代理地址 (e.g. https://proxy.com/https://target.com/video/123)
+        // 剥离代理前缀，还原为 https://target.com/video/123
+        const rawRefererPath = clientReferer.slice(url.origin.length);
+        // 去掉可能存在的起始 '/'
+        let cleanPath = rawRefererPath.startsWith('/') ? rawRefererPath.slice(1) : rawRefererPath;
+        
+        // 修正协议 (handle http:/example.com case if needed, though simple slice usually works if proxy structure is consistent)
+        if (cleanPath.startsWith("http") && !cleanPath.startsWith("http://") && !cleanPath.startsWith("https://")) {
+            cleanPath = cleanPath.replace(/^(https?):\/+/, "$1://");
+        }
+        
+        if (cleanPath.startsWith("http")) {
+            upstreamReferer = cleanPath;
+        }
+    }
+
+    // 如果无法从客户端 Referer 提取（例如直接访问或 Referer 为空），
+    // 或者是 sub-resource 请求但没有携带正确 Referer，
+    // 我们默认伪造为 Target 的 Origin + Path (Self Referer) 或者 Origin Root
+    // 为了通过防盗链，通常 "Referer: https://target.com/some/page" 访问 "https://target.com/video.m3u8" 是合法的。
+    // 这里我们保守一点：如果提取不到，就使用 targetUrl.origin + "/"，这能通过大多数 Origin Check。
+    if (!upstreamReferer) {
+        upstreamReferer = targetUrl.origin + "/";
+    }
+
+    newHeaders.set("Referer", upstreamReferer);
     
-    // 强制伪造 Origin (主要用于 POST 请求或 CORS 检查)
+    // 3. Origin 处理 (CORS / POST)
     newHeaders.set("Origin", targetUrl.origin);
 
-    // 补全 User-Agent (防止某些服务器拒绝空 UA)
-    if (!newHeaders.has("User-Agent")) {
-        newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
-    }
+    // 4. User-Agent
+    // 使用较新的 Chrome User-Agent
+    newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
 
-    // 添加一些浏览器标准头，让请求看起来更像真实浏览器
-    newHeaders.set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
-    if (!newHeaders.has("Accept")) {
-        newHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
-    }
-
-    // 移除可能暴露代理身份的头 (X-Forwarded-For 由 CF Worker 自动处理，我们尽量减少额外痕迹)
+    // 5. 移除可能暴露 IP 的头
     newHeaders.delete("X-Forwarded-For");
     newHeaders.delete("X-Real-IP");
+
 
     // 5. 发起请求
     let response;
@@ -130,7 +151,7 @@ export default {
         method: request.method,
         headers: newHeaders,
         body: request.body,
-        redirect: "manual" // 手动处理重定向
+        redirect: "manual"
       });
     } catch (e) {
       return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
@@ -140,17 +161,13 @@ export default {
     const responseHeaders = new Headers(response.headers);
     UNSAFE_RESPONSE_HEADERS.forEach(h => responseHeaders.delete(h));
 
-    // 允许跨域，方便本地开发或由其他前端调用
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     
-    // 修复：确保 Set-Cookie 能正确传递回客户端
-    // 部分网站设置 Cookie 时指定了 Domain，浏览器可能会因为 Domain 不匹配当前代理域名而拒绝写入
-    // 我们简单粗暴地移除 Domain 属性，让 Cookie 写入当前代理域
+    // 处理 Set-Cookie (移除 Domain 限制)
     const setCookie = responseHeaders.get("Set-Cookie");
     if (setCookie) {
-        // 简单的替换逻辑，移除 Domain=xxx; 
         const newCookie = setCookie.replace(/Domain=[^;]+;?/gi, "");
         responseHeaders.set("Set-Cookie", newCookie);
     }
@@ -159,11 +176,9 @@ export default {
     const location = responseHeaders.get("Location");
     if (location) {
       try {
-        // 处理相对路径重定向
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
         
-        // 如果是 301/302/303/307/308，我们需要修改 Location，让浏览器跳回代理地址
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             return new Response(null, {
                 status: response.status,
@@ -177,7 +192,7 @@ export default {
 
     // 7. 内容处理
     
-    // A. M3U8 视频流 (常见于视频网站)
+    // A. M3U8 视频流
     if (contentType.includes("application/vnd.apple.mpegurl") || 
         contentType.includes("application/x-mpegurl") ||
         actualUrlStr.endsWith(".m3u8")) {
@@ -231,7 +246,6 @@ export default {
                     }
                 }
 
-                // 劫持 History API
                 const oldPushState = history.pushState;
                 const oldReplaceState = history.replaceState;
                 
@@ -249,7 +263,6 @@ export default {
                     return oldReplaceState.apply(this, wrapHistoryArgs(args));
                 };
 
-                // 劫持 fetch
                 const oldFetch = window.fetch;
                 window.fetch = function(input, init) {
                     let url = input;
@@ -259,7 +272,6 @@ export default {
                     return oldFetch(url, init);
                 };
 
-                // 劫持 XHR
                 const oldOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(method, url, ...args) {
                     return oldOpen.call(this, method, wrapUrl(url), ...args);
@@ -274,9 +286,9 @@ export default {
         .on("script", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("form", new AttributeRewriter("action", url.origin, targetUrl.href))
         .on("iframe", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("video", new AttributeRewriter("src", url.origin, targetUrl.href)) // 视频标签
+        .on("video", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("audio", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("source", new AttributeRewriter("src", url.origin, targetUrl.href)) // source 标签
+        .on("source", new AttributeRewriter("src", url.origin, targetUrl.href))
         .on("track", new AttributeRewriter("src", url.origin, targetUrl.href));
 
       return rewriter.transform(new Response(response.body, {
@@ -286,7 +298,6 @@ export default {
       }));
     }
 
-    // 其他内容直接返回
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -312,7 +323,6 @@ class AttributeRewriter {
       } catch (e) {}
     }
     
-    // 处理 srcset (图片响应式)
     if (element.tagName === "img" && element.hasAttribute("srcset")) {
         const srcset = element.getAttribute("srcset");
         const newSrcset = srcset.split(",").map(part => {
@@ -325,7 +335,6 @@ class AttributeRewriter {
         element.setAttribute("srcset", newSrcset);
     }
 
-    // 处理 data-src (懒加载常见)
     const dataSrc = element.getAttribute("data-src");
     if (dataSrc) {
         try {
@@ -334,7 +343,6 @@ class AttributeRewriter {
         } catch (e) {}
     }
     
-    // 处理 poster (视频封面)
     if (element.tagName === "video") {
         const poster = element.getAttribute("poster");
         if (poster) {
