@@ -1,12 +1,17 @@
 // _worker.js
 
-// 想要移除的响应头 (解决 CSP, Frame 限制等问题)
+/**
+ * 响应头清理列表
+ * 移除 CSP、HSTS、Frame Options 等可能阻止代理在 iframe 或前端 fetch 中运行的安全头
+ */
 const UNSAFE_HEADERS = new Set([
   "content-security-policy",
   "content-security-policy-report-only",
   "x-frame-options",
   "x-xss-protection",
-  "x-content-type-options"
+  "x-content-type-options",
+  "strict-transport-security", // HSTS
+  "clear-site-data"
 ]);
 
 export default {
@@ -20,15 +25,34 @@ export default {
       });
     }
 
-    // 2. 解析目标 URL
+    // 2. 访问 /favicon.ico 直接返回 204
+    if (url.pathname === "/favicon.ico") {
+        return new Response(null, { status: 204 });
+    }
+
+    // 3. 处理 OPTIONS 预检请求 (CORS 增强)
+    // 参考 netnr/proxy 对预检请求的处理，返回允许所有源、头和方法
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD",
+          "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
+          "Access-Control-Max-Age": "86400" // 缓存预检结果 24 小时
+        }
+      });
+    }
+
+    // 4. 解析目标 URL
     let actualUrlStr = url.pathname.slice(1) + url.search + url.hash;
 
-    // 2.1 尝试从路径中修正协议
+    // 4.1 尝试从路径中修正协议
     if (actualUrlStr.startsWith("http") && !actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
         actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
     }
 
-    // 2.2 处理相对路径请求
+    // 4.2 处理相对路径请求
     if (!actualUrlStr.startsWith("http")) {
       const referer = request.headers.get("Referer");
       if (referer) {
@@ -44,7 +68,7 @@ export default {
             if (refererTargetStr.startsWith("http")) {
                 const targetBase = new URL(refererTargetStr);
                 // 使用 url.pathname (带 /) 而不是 actualUrlStr (不带 /)
-                // 这样 new URL('/path', base) 会正确解析为 root-relative，而不是 path-relative
+                // 这样 new URL('/path', base) 会正确解析为 root-relative
                 actualUrlStr = new URL(url.pathname + url.search + url.hash, targetBase.href).href;
             }
           }
@@ -52,26 +76,21 @@ export default {
       }
     }
 
-    // 3. 处理 OPTIONS 预检请求
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-          "Access-Control-Allow-Headers": "*"
-        }
-      });
-    }
-
-    // 4. 准备代理请求
+    // 5. 准备代理请求
     let targetUrl;
     try {
       if (!actualUrlStr.startsWith("http")) {
-          return new Response("Invalid URL (No Protocol): " + actualUrlStr, { status: 400 });
+          return new Response("Invalid URL (No Protocol): " + actualUrlStr, { 
+              status: 400,
+              headers: { "Access-Control-Allow-Origin": "*" } 
+          });
       }
       targetUrl = new URL(actualUrlStr);
     } catch (e) {
-      return new Response("Invalid URL Parse Error: " + actualUrlStr, { status: 400 });
+      return new Response("Invalid URL Parse Error: " + actualUrlStr, { 
+          status: 400,
+          headers: { "Access-Control-Allow-Origin": "*" }
+      });
     }
 
     const newHeaders = new Headers();
@@ -80,8 +99,11 @@ export default {
     // 复制原请求头，但过滤掉 CF 特定头、Cookie 和 Security 头
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
+      // 过滤掉可能干扰代理请求的头
       if (lowerKey.startsWith("cf-") || 
-          lowerKey.startsWith("sec-") || 
+          lowerKey === "host" ||
+          lowerKey === "origin" ||
+          lowerKey === "referer" ||
           lowerKey === "cookie") {
         continue;
       }
@@ -96,7 +118,7 @@ export default {
     // 关键：伪造 Host
     newHeaders.set("Host", targetUrl.host);
     
-    // 只有在非 GET 请求时才发送 Origin
+    // 只有在非 GET 请求时才发送 Origin，且指向目标源
     if (!isSafeMethod) {
         newHeaders.set("Origin", targetUrl.origin);
     }
@@ -108,33 +130,44 @@ export default {
         if (realRefererPart.startsWith("http")) {
              newHeaders.set("Referer", realRefererPart);
         }
-    } 
+    } else {
+        newHeaders.set("Referer", targetUrl.href);
+    }
 
-    // 5. 发起请求
+    // 6. 发起请求
     let response;
     try {
       response = await fetch(actualUrlStr, {
         method: request.method,
         headers: newHeaders,
         body: request.body,
-        redirect: "manual"
+        redirect: "manual" // 手动处理重定向以修正 Location 头
       });
     } catch (e) {
-      return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
+      return new Response("Proxy Fetch Error: " + e.message, { 
+          status: 502,
+          headers: { "Access-Control-Allow-Origin": "*" }
+      });
     }
 
-    // 6. 处理响应头
+    // 7. 处理响应头 (CORS 增强)
     const responseHeaders = new Headers(response.headers);
+    
+    // 移除不安全/限制性头
     UNSAFE_HEADERS.forEach(h => responseHeaders.delete(h));
 
+    // 添加完整的 CORS 头
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD");
+    // 关键：暴露所有头给前端 JS (解决 netnr/proxy 指出的 header 不可见问题)
+    responseHeaders.set("Access-Control-Expose-Headers", "*");
 
     // 重写重定向 Location
     const location = responseHeaders.get("Location");
     if (location) {
       try {
+        // 如果是相对路径或绝对路径，都将其包裹在代理 URL 中
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
       } catch (e) {}
@@ -142,40 +175,44 @@ export default {
 
     const contentType = responseHeaders.get("Content-Type") || "";
 
-    // 7. 内容处理
+    // 8. 内容处理
     
-    // A. M3U8 视频流
+    // A. M3U8 视频流处理
     if (contentType.includes("application/vnd.apple.mpegurl") || 
         contentType.includes("application/x-mpegurl") ||
         actualUrlStr.endsWith(".m3u8")) {
         
-        let text = await response.text();
-        const baseUrl = actualUrlStr.substring(0, actualUrlStr.lastIndexOf("/") + 1);
-        
-        text = text.replace(/^(?!#)(?!\s)(.+)$/gm, (match) => {
-            match = match.trim();
-            if (match === "") return match;
-            let absoluteUrl;
-            try {
-                if (match.startsWith("http")) {
-                    absoluteUrl = match;
-                } else {
-                    absoluteUrl = new URL(match, baseUrl).href;
+        try {
+            let text = await response.text();
+            const baseUrl = actualUrlStr.substring(0, actualUrlStr.lastIndexOf("/") + 1);
+            
+            text = text.replace(/^(?!#)(?!\s)(.+)$/gm, (match) => {
+                match = match.trim();
+                if (match === "") return match;
+                let absoluteUrl;
+                try {
+                    if (match.startsWith("http")) {
+                        absoluteUrl = match;
+                    } else {
+                        absoluteUrl = new URL(match, baseUrl).href;
+                    }
+                    return url.origin + "/" + absoluteUrl;
+                } catch (e) {
+                    return match;
                 }
-                return url.origin + "/" + absoluteUrl;
-            } catch (e) {
-                return match;
-            }
-        });
+            });
 
-        return new Response(text, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: responseHeaders
-        });
+            return new Response(text, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: responseHeaders
+            });
+        } catch(e) {
+            // 如果解析失败，回退到直接返回
+        }
     }
 
-    // B. HTML 内容
+    // B. HTML 内容重写 (注入脚本以拦截前端请求)
     if (contentType.includes("text/html")) {
       const rewriter = new HTMLRewriter()
         .on("head", {
@@ -198,26 +235,19 @@ export default {
                     }
                 }
 
-                // 1. 劫持 History API (pushState, replaceState) 防止 SPA 移除代理前缀
+                // 1. 劫持 History API
                 const oldPushState = history.pushState;
                 const oldReplaceState = history.replaceState;
-                
                 function wrapHistoryArgs(args) {
-                    // args: [state, title, url]
                     if (args.length >= 3 && typeof args[2] === 'string') {
                         args[2] = wrapUrl(args[2]);
                     }
                     return args;
                 }
+                history.pushState = function(...args) { return oldPushState.apply(this, wrapHistoryArgs(args)); };
+                history.replaceState = function(...args) { return oldReplaceState.apply(this, wrapHistoryArgs(args)); };
 
-                history.pushState = function(...args) {
-                    return oldPushState.apply(this, wrapHistoryArgs(args));
-                };
-                history.replaceState = function(...args) {
-                    return oldReplaceState.apply(this, wrapHistoryArgs(args));
-                };
-
-                // 2. 劫持原生属性赋值
+                // 2. 劫持 DOM 属性赋值
                 const elementProtos = [window.HTMLAnchorElement, window.HTMLImageElement, window.HTMLLinkElement, window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLSourceElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLFormElement];
                 elementProtos.forEach(Proto => {
                     if (!Proto) return;
@@ -229,10 +259,7 @@ export default {
                     if (descriptor && descriptor.set) {
                         const originalSet = descriptor.set;
                         Object.defineProperty(proto, attrName, {
-                            set: function(val) {
-                                const wrapped = wrapUrl(val);
-                                originalSet.call(this, wrapped);
-                            },
+                            set: function(val) { originalSet.call(this, wrapUrl(val)); },
                             get: descriptor.get,
                             enumerable: true,
                             configurable: true
@@ -244,9 +271,8 @@ export default {
                 const oldFetch = window.fetch;
                 window.fetch = function(input, init) {
                     let url = input;
-                    if (typeof input === 'string') {
-                        url = wrapUrl(input);
-                    }
+                    if (typeof input === 'string') url = wrapUrl(input);
+                    else if (input instanceof Request) url = new Request(wrapUrl(input.url), input);
                     return oldFetch(url, init);
                 };
 
@@ -304,6 +330,7 @@ export default {
       }));
     }
 
+    // 9. 其他类型直接返回 (带处理过的 CORS 头)
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -312,6 +339,10 @@ export default {
   }
 };
 
+/**
+ * 属性重写器类
+ * 用于 HTMLRewriter 重写 HTML 中的相对路径
+ */
 class AttributeRewriter {
   constructor(attributeName, proxyOrigin, currentTargetUrl) {
     this.attributeName = attributeName;
@@ -328,6 +359,7 @@ class AttributeRewriter {
         element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
       } catch (e) {}
     }
+    // 特殊处理 srcset
     if (element.tagName === "img" && element.hasAttribute("srcset")) {
         const srcset = element.getAttribute("srcset");
         const newSrcset = srcset.split(",").map(part => {
@@ -339,6 +371,7 @@ class AttributeRewriter {
         }).join(", ");
         element.setAttribute("srcset", newSrcset);
     }
+    // 特殊处理 data-src (常见的懒加载属性)
     const dataSrc = element.getAttribute("data-src");
     if (dataSrc) {
         try {
@@ -349,6 +382,9 @@ class AttributeRewriter {
   }
 }
 
+/**
+ * 返回根路径的 UI 界面
+ */
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
