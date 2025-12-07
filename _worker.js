@@ -1,4 +1,4 @@
-// _workers.js
+// _worker.js
 
 // 想要移除的响应头 (解决 CSP, Frame 限制等问题)
 const UNSAFE_HEADERS = new Set([
@@ -90,12 +90,12 @@ export default {
     const newHeaders = new Headers();
     const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(request.method);
 
-    // 复制原请求头，但过滤掉 CF 特定头和 Security 头
-    // 保留 Cookie 以支持需要登录的站点
+    // 复制原请求头，但过滤掉 CF 特定头、Cookie 和 Security 头
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
       if (lowerKey.startsWith("cf-") || 
-          lowerKey.startsWith("sec-")) {
+          lowerKey.startsWith("sec-") || 
+          lowerKey === "cookie") {
         continue;
       }
       newHeaders.set(key, value);
@@ -180,8 +180,8 @@ export default {
                 } else {
                     absoluteUrl = new URL(match, baseUrl).href;
                 }
-                // 对 M3U8 内的链接也进行编码，防止被客户端广告屏蔽插件误杀
-                return url.origin + "/" + encodeURIComponent(absoluteUrl);
+                // M3U8 内部链接一般不编码，直接拼接
+                return url.origin + "/" + absoluteUrl;
             } catch (e) {
                 return match;
             }
@@ -211,8 +211,9 @@ export default {
                     if (u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('javascript:')) return u;
                     try {
                         const absolute = new URL(u, REAL_BASE_URL).href;
-                        // 编码 URL 以避免被客户端广告拦截器 (如 uBlock) 根据路径规则屏蔽
-                        return PROXY_ORIGIN + '/' + encodeURIComponent(absolute);
+                        // 动态脚本中不使用 encodeURIComponent，因为浏览器会自动处理大部分字符，
+                        // 且保持可读性。服务端已做解码兼容。
+                        return PROXY_ORIGIN + '/' + absolute;
                     } catch(e) {
                         return u;
                     }
@@ -307,7 +308,7 @@ export default {
                              const originalUrl = match[1];
                              try {
                                  const absoluteUrl = new URL(originalUrl, targetUrl.href).href;
-                                 const newUrl = url.origin + "/" + encodeURIComponent(absoluteUrl);
+                                 const newUrl = url.origin + "/" + absoluteUrl;
                                  const newContent = content.replace(originalUrl, newUrl);
                                  element.setAttribute("content", newContent);
                              } catch(e) {}
@@ -345,8 +346,8 @@ class AttributeRewriter {
       if (value.startsWith("data:") || value.startsWith("#") || value.startsWith("javascript:")) return;
       try {
         const resolvedUrl = new URL(value, this.currentTargetUrl).href;
-        // 编码 URL，规避客户端广告过滤
-        element.setAttribute(this.attributeName, this.proxyOrigin + "/" + encodeURIComponent(resolvedUrl));
+        // 使用未编码的 URL 拼接，保持简单。服务端入口已支持解码。
+        element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
       } catch (e) {}
     }
     if (element.tagName === "img" && element.hasAttribute("srcset")) {
@@ -355,7 +356,7 @@ class AttributeRewriter {
             const [u, d] = part.trim().split(/\s+/);
             try {
                 const resolved = new URL(u, this.currentTargetUrl).href;
-                return this.proxyOrigin + "/" + encodeURIComponent(resolved) + (d ? " " + d : "");
+                return this.proxyOrigin + "/" + resolved + (d ? " " + d : "");
             } catch(e) { return part; }
         }).join(", ");
         element.setAttribute("srcset", newSrcset);
@@ -364,7 +365,7 @@ class AttributeRewriter {
     if (dataSrc) {
         try {
             const resolvedUrl = new URL(dataSrc, this.currentTargetUrl).href;
-            element.setAttribute("data-src", this.proxyOrigin + "/" + encodeURIComponent(resolvedUrl));
+            element.setAttribute("data-src", this.proxyOrigin + "/" + resolvedUrl);
         } catch (e) {}
     }
   }
