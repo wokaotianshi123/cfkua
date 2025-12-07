@@ -1,71 +1,34 @@
 // _worker.js
 
-// 想要移除的响应头 (解决 CSP, Frame 限制, 以及清除上游的 CORS 限制)
+// 想要移除的响应头 (解决 CSP, Frame 限制等问题)
 const UNSAFE_HEADERS = new Set([
   "content-security-policy",
   "content-security-policy-report-only",
   "x-frame-options",
   "x-xss-protection",
-  "x-content-type-options",
-  "access-control-allow-origin",
-  "access-control-allow-methods",
-  "access-control-allow-headers",
-  "access-control-expose-headers",
-  "access-control-allow-credentials",
-  "access-control-max-age",
-  // 额外清理可能导致问题的安全头
-  "strict-transport-security" 
+  "x-content-type-options"
 ]);
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // --------------------------------------------------------------------------------
-    // 1. CORS 处理逻辑 (参考 Cloudflare-Pages-Universal-Proxy)
-    // --------------------------------------------------------------------------------
-    const origin = request.headers.get("Origin") || "*";
-    const requestHeaders = request.headers.get("Access-Control-Request-Headers");
-    
-    // 构造动态 CORS 头，支持 Credentials 和各种请求头
-    const corsHeaders = {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH",
-        "Access-Control-Allow-Headers": requestHeaders || "*",
-        "Access-Control-Expose-Headers": "*",
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Max-Age": "86400"
-    };
-
-    // 处理 OPTIONS 预检请求 (直接返回，不走后续逻辑)
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders
-      });
-    }
-
-    // --------------------------------------------------------------------------------
-    // 2. 根路径 UI 返回
-    // --------------------------------------------------------------------------------
-    // 如果是根路径且没有查询参数（意味着不是代理请求），返回欢迎页面
-    if (url.pathname === "/" && !url.search) {
+    // 1. 访问根目录，返回 UI
+    if (url.pathname === "/") {
       return new Response(getRootHtml(), {
         headers: { "Content-Type": "text/html; charset=utf-8" }
       });
     }
 
-    // --------------------------------------------------------------------------------
-    // 3. 目标 URL 解析
-    // --------------------------------------------------------------------------------
+    // 2. 解析目标 URL
     let actualUrlStr = url.pathname.slice(1) + url.search + url.hash;
 
-    // 3.1 尝试从路径中修正协议
+    // 2.1 尝试从路径中修正协议
     if (actualUrlStr.startsWith("http") && !actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
         actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
     }
 
-    // 3.2 处理相对路径请求
+    // 2.2 处理相对路径请求
     if (!actualUrlStr.startsWith("http")) {
       const referer = request.headers.get("Referer");
       if (referer) {
@@ -89,9 +52,18 @@ export default {
       }
     }
 
-    // --------------------------------------------------------------------------------
+    // 3. 处理 OPTIONS 预检请求
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+          "Access-Control-Allow-Headers": "*"
+        }
+      });
+    }
+
     // 4. 准备代理请求
-    // --------------------------------------------------------------------------------
     let targetUrl;
     try {
       if (!actualUrlStr.startsWith("http")) {
@@ -136,14 +108,9 @@ export default {
         if (realRefererPart.startsWith("http")) {
              newHeaders.set("Referer", realRefererPart);
         }
-    } else {
-        // 如果没有 Referer，默认给一个目标根目录，防止某些防盗链
-        newHeaders.set("Referer", targetUrl.origin + "/");
-    }
+    } 
 
-    // --------------------------------------------------------------------------------
     // 5. 发起请求
-    // --------------------------------------------------------------------------------
     let response;
     try {
       response = await fetch(actualUrlStr, {
@@ -156,18 +123,13 @@ export default {
       return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
     }
 
-    // --------------------------------------------------------------------------------
     // 6. 处理响应头
-    // --------------------------------------------------------------------------------
     const responseHeaders = new Headers(response.headers);
-    
-    // 清理不安全的头和上游的 CORS 头
     UNSAFE_HEADERS.forEach(h => responseHeaders.delete(h));
 
-    // 应用动态生成的 CORS 头
-    Object.keys(corsHeaders).forEach(key => {
-        responseHeaders.set(key, corsHeaders[key]);
-    });
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Credentials", "true");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
 
     // 重写重定向 Location
     const location = responseHeaders.get("Location");
@@ -180,9 +142,7 @@ export default {
 
     const contentType = responseHeaders.get("Content-Type") || "";
 
-    // --------------------------------------------------------------------------------
-    // 7. 内容重写 (M3U8 & HTML)
-    // --------------------------------------------------------------------------------
+    // 7. 内容处理
     
     // A. M3U8 视频流
     if (contentType.includes("application/vnd.apple.mpegurl") || 
