@@ -7,7 +7,6 @@ const UNSAFE_HEADERS = new Set([
   "x-frame-options",
   "x-xss-protection",
   "x-content-type-options",
-  // 关键：移除上游服务器可能存在的严格 CORS 头，以便我们自己接管
   "access-control-allow-origin",
   "access-control-allow-methods",
   "access-control-allow-headers",
@@ -59,22 +58,28 @@ export default {
       }
     }
 
-    // 3. 处理 OPTIONS 预检请求 (COS/跨域关键)
-    // 直接返回 204 No Content，并允许所有跨域请求，不再转发给 COS
+    // 3. 构建 CORS 头部 (参考 ciao-cors: 动态反射 Origin 和 Headers 以支持 Credentials)
+    const origin = request.headers.get("Origin") || "*";
+    const requestHeaders = request.headers.get("Access-Control-Request-Headers");
+    
+    const corsHeaders = {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH",
+        "Access-Control-Allow-Headers": requestHeaders || "*",
+        "Access-Control-Expose-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Max-Age": "86400"
+    };
+
+    // 4. 处理 OPTIONS 预检请求
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD",
-          "Access-Control-Allow-Headers": "*",
-          "Access-Control-Max-Age": "86400",
-          "Access-Control-Allow-Credentials": "true"
-        }
+        headers: corsHeaders
       });
     }
 
-    // 4. 准备代理请求
+    // 5. 准备代理请求
     let targetUrl;
     try {
       if (!actualUrlStr.startsWith("http")) {
@@ -104,15 +109,15 @@ export default {
         newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
     }
 
-    // 关键：伪造 Host，让 COS 以为是直接访问
+    // 关键：伪造 Host
     newHeaders.set("Host", targetUrl.host);
     
-    // 只有在非 GET 请求时才发送 Origin，并且要伪造 Origin 为目标域名，欺骗 COS 跨域检查
+    // 只有在非 GET 请求时才发送 Origin
     if (!isSafeMethod) {
         newHeaders.set("Origin", targetUrl.origin);
     }
     
-    // 智能 Referer 处理：如果 Referer 是代理地址，剥离它；否则可能导致防盗链拦截
+    // 智能 Referer 处理
     const clientReferer = request.headers.get("Referer");
     if (clientReferer && clientReferer.startsWith(url.origin)) {
         const realRefererPart = clientReferer.slice(url.origin.length + 1);
@@ -120,11 +125,11 @@ export default {
              newHeaders.set("Referer", realRefererPart);
         }
     } else {
-        // 如果没有 Referer 或者是不相关的，可以设为目标根目录，绕过部分防盗链
+        // 如果没有 Referer，默认给一个目标根目录，防止某些防盗链
         newHeaders.set("Referer", targetUrl.origin + "/");
     }
 
-    // 5. 发起请求
+    // 6. 发起请求
     let response;
     try {
       response = await fetch(actualUrlStr, {
@@ -137,17 +142,14 @@ export default {
       return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
     }
 
-    // 6. 处理响应头
+    // 7. 处理响应头
     const responseHeaders = new Headers(response.headers);
-    // 移除上游的限制性头
     UNSAFE_HEADERS.forEach(h => responseHeaders.delete(h));
 
-    // 强制添加宽容的 CORS 头
-    responseHeaders.set("Access-Control-Allow-Origin", "*");
-    responseHeaders.set("Access-Control-Allow-Credentials", "true");
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD");
-    responseHeaders.set("Access-Control-Allow-Headers", "*");
-    responseHeaders.set("Access-Control-Expose-Headers", "*");
+    // 应用动态生成的 CORS 头
+    Object.keys(corsHeaders).forEach(key => {
+        responseHeaders.set(key, corsHeaders[key]);
+    });
 
     // 重写重定向 Location
     const location = responseHeaders.get("Location");
@@ -160,7 +162,7 @@ export default {
 
     const contentType = responseHeaders.get("Content-Type") || "";
 
-    // 7. 内容处理
+    // 8. 内容处理
     
     // A. M3U8 视频流
     if (contentType.includes("application/vnd.apple.mpegurl") || 
