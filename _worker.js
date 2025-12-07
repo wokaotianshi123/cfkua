@@ -1,442 +1,227 @@
-// _worker.js
-
-/**
- * Cloudflare Workers Proxy
- * 
- * Combined logic from:
- * 1. User provided script (HTMLRewriter, UI, URL parsing)
- * 2. ymyuuu/Cloudflare-Workers-Proxy (Robust CORS handling, Header filtering)
- */
-
-// Headers to strip from the upstream response to ensure security and proxy functionality
-const PRESERVE_HEADERS = new Set([
-  'content-type',
-  'content-length',
-  'last-modified',
-  'etag',
-  'cache-control',
-  'expires',
-]);
-
-// Headers that interfere with the proxy rendering or security
-const UNSAFE_RESPONSE_HEADERS = new Set([
-  'content-security-policy',
-  'content-security-policy-report-only',
-  'x-frame-options',
-  'x-xss-protection',
-  'x-content-type-options',
-  'report-to',
-  'nel',
-  'access-control-allow-origin',
-  'access-control-allow-methods',
-  'access-control-allow-headers',
-  'access-control-allow-credentials',
-  'access-control-max-age',
-  'access-control-expose-headers'
-]);
-
-// Headers not to send to the upstream server
-const UNSAFE_REQUEST_HEADERS = new Set([
-  'cookie',
-  'host',
-  'origin',
-  'referer',
-  'cf-connecting-ip',
-  'cf-ipcountry',
-  'cf-ray',
-  'cf-visitor',
-  'x-forwarded-proto',
-  'x-real-ip'
-]);
-
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
-    // 1. Root path returns the UI
-    if (url.pathname === "/") {
-      return new Response(getRootHtml(), {
-        headers: { "Content-Type": "text/html; charset=utf-8" }
-      });
-    }
-
-    // 2. Parse target URL
-    let actualUrlStr = url.pathname.slice(1) + url.search + url.hash;
-
-    // 2.1 Protocol fix (e.g. https:/google.com -> https://google.com)
-    if (actualUrlStr.startsWith("http") && !actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
-        actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
-    }
-
-    // 2.2 Handle relative paths (via Referer)
-    if (!actualUrlStr.startsWith("http")) {
-      const referer = request.headers.get("Referer");
-      if (referer) {
-        try {
-          const refererObj = new URL(referer);
-          if (refererObj.origin === url.origin) {
-            let refererTargetStr = refererObj.pathname.slice(1) + refererObj.search;
-            if (refererTargetStr.startsWith("http") && !refererTargetStr.startsWith("http://") && !refererTargetStr.startsWith("https://")) {
-                refererTargetStr = refererTargetStr.replace(/^(https?):\/+/, "$1://");
-            }
-
-            if (refererTargetStr.startsWith("http")) {
-                const targetBase = new URL(refererTargetStr);
-                actualUrlStr = new URL(url.pathname + url.search + url.hash, targetBase.href).href;
-            }
+      // 如果访问根目录，返回HTML
+      if (url.pathname === "/") {
+        return new Response(getRootHtml(), {
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8'
           }
-        } catch (e) {}
+        });
       }
-    }
 
-    // Validate URL
-    if (!actualUrlStr.startsWith("http")) {
-       // If mostly invalid, try adding https:// if it looks like a domain
-       if (actualUrlStr.indexOf('.') > -1 && actualUrlStr.indexOf('/') === -1) {
-           actualUrlStr = 'https://' + actualUrlStr;
-       } else {
-           return new Response("Invalid URL: " + actualUrlStr, { status: 400 });
-       }
-    }
+      // 从请求路径中提取目标 URL
+      // 例如：https://your-pages.pages.dev/https://google.com -> https://google.com
+      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
 
-    let targetUrl;
-    try {
-      targetUrl = new URL(actualUrlStr);
-    } catch (e) {
-      return new Response("Invalid URL Parse Error: " + actualUrlStr, { status: 400 });
-    }
+      // 判断用户输入的 URL 是否带有协议
+      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
 
-    // 3. Handle OPTIONS (CORS Preflight)
-    // Always return permissive CORS headers for OPTIONS requests
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 200,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD",
-          "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
-          "Access-Control-Allow-Credentials": "true",
-          "Access-Control-Max-Age": "86400"
-        }
-      });
-    }
+      // 保留查询参数
+      actualUrlStr += url.search;
 
-    // 4. Construct Upstream Request
-    const newHeaders = new Headers();
-    
-    // Copy allowlisted headers
-    for (const [key, value] of request.headers) {
-      const lowerKey = key.toLowerCase();
-      if (!UNSAFE_REQUEST_HEADERS.has(lowerKey) && !lowerKey.startsWith('cf-')) {
-        newHeaders.set(key, value);
-      }
-    }
+      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
 
-    // Set essential headers for spoofing
-    newHeaders.set("Host", targetUrl.host);
-    newHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
-    
-    // Origin handling: If sending data, set Origin to target, otherwise omit or ensure valid
-    if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
-        newHeaders.set("Origin", targetUrl.origin);
-    }
-    
-    // Referer handling
-    const clientReferer = request.headers.get("Referer");
-    if (clientReferer && clientReferer.startsWith(url.origin)) {
-        const realRefererPart = clientReferer.slice(url.origin.length + 1);
-        // Clean up the extracted referer
-        let fixedReferer = realRefererPart;
-        if (fixedReferer.startsWith("http") && !fixedReferer.startsWith("http://") && !fixedReferer.startsWith("https://")) {
-            fixedReferer = fixedReferer.replace(/^(https?):\/+/, "$1://");
-        }
-        if (fixedReferer.startsWith("http")) {
-             newHeaders.set("Referer", fixedReferer);
-        }
-    } else {
-        newHeaders.set("Referer", targetUrl.href);
-    }
-
-    // 5. Fetch from Upstream
-    let response;
-    try {
-      response = await fetch(actualUrlStr, {
-        method: request.method,
+      // 创建一个新的请求以访问目标 URL
+      const modifiedRequest = new Request(actualUrlStr, {
         headers: newHeaders,
+        method: request.method,
         body: request.body,
-        redirect: "manual" // We handle redirects manually to rewrite Location
+        redirect: 'manual'
       });
-    } catch (e) {
-      return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
-    }
 
-    // 6. Process Response Headers
-    const responseHeaders = new Headers();
-    
-    // Copy upstream headers while filtering unsafe ones
-    for (const [key, value] of response.headers) {
-        const lowerKey = key.toLowerCase();
-        if (!UNSAFE_RESPONSE_HEADERS.has(lowerKey)) {
-            responseHeaders.set(key, value);
-        }
-    }
+      // 发起对目标 URL 的请求
+      const response = await fetch(modifiedRequest);
+      let body = response.body;
 
-    // Enforce CORS on Response
-    responseHeaders.set("Access-Control-Allow-Origin", "*");
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD");
-    responseHeaders.set("Access-Control-Allow-Credentials", "true");
-    // Ensure all requested headers are allowed in the response
-    const reqHeaders = request.headers.get("Access-Control-Request-Headers");
-    if (reqHeaders) {
-        responseHeaders.set("Access-Control-Allow-Headers", reqHeaders);
-    } else {
-        responseHeaders.set("Access-Control-Allow-Headers", "*");
-    }
-    responseHeaders.set("Access-Control-Expose-Headers", "*");
-
-    // Rewrite Location header for redirects
-    const location = response.headers.get("Location");
-    if (location) {
-      try {
-        // Resolve relative redirects against the target URL
-        const absoluteLocation = new URL(location, targetUrl.href).href;
-        responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
-      } catch (e) {
-        // Fallback if URL resolution fails
-        responseHeaders.set("Location", location);
+      // 处理重定向
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        body = response.body;
+        // 创建新的 Response 对象以修改 Location 头部
+        return handleRedirect(response, body);
+      } else if (response.headers.get("Content-Type")?.includes("text/html")) {
+        // 如果是 HTML 内容，尝试重写其中的相对路径
+        body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       }
-    }
 
-    const contentType = responseHeaders.get("Content-Type") || "";
-    const status = response.status;
-
-    // 7. Content Rewriting
-    
-    // A. M3U8 Playlist
-    if (contentType.includes("application/vnd.apple.mpegurl") || 
-        contentType.includes("application/x-mpegurl") ||
-        actualUrlStr.endsWith(".m3u8")) {
-        
-        let text = await response.text();
-        const baseUrl = actualUrlStr.substring(0, actualUrlStr.lastIndexOf("/") + 1);
-        
-        text = text.replace(/^(?!#)(?!\s)(.+)$/gm, (match) => {
-            match = match.trim();
-            if (match === "") return match;
-            let absoluteUrl;
-            try {
-                if (match.startsWith("http")) {
-                    absoluteUrl = match;
-                } else {
-                    absoluteUrl = new URL(match, baseUrl).href;
-                }
-                return url.origin + "/" + absoluteUrl;
-            } catch (e) {
-                return match;
-            }
-        });
-
-        return new Response(text, {
-            status: status,
-            statusText: response.statusText,
-            headers: responseHeaders
-        });
-    }
-
-    // B. HTML Content
-    if (contentType.includes("text/html")) {
-      const rewriter = new HTMLRewriter()
-        .on("head", {
-          element(element) {
-            element.append(`
-            <script>
-              (function() {
-                const PROXY_ORIGIN = window.location.origin;
-                const REAL_BASE_URL = '${targetUrl.href}';
-
-                function wrapUrl(u) {
-                    if (!u) return u;
-                    if (typeof u !== 'string') return u;
-                    if (u.startsWith(PROXY_ORIGIN)) return u;
-                    if (u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('javascript:')) return u;
-                    try {
-                        const absolute = new URL(u, REAL_BASE_URL).href;
-                        return PROXY_ORIGIN + '/' + absolute;
-                    } catch(e) {
-                        return u;
-                    }
-                }
-
-                // 1. History API Hook
-                const oldPushState = history.pushState;
-                const oldReplaceState = history.replaceState;
-                
-                function wrapHistoryArgs(args) {
-                    if (args.length >= 3 && typeof args[2] === 'string') {
-                        args[2] = wrapUrl(args[2]);
-                    }
-                    return args;
-                }
-
-                history.pushState = function(...args) {
-                    return oldPushState.apply(this, wrapHistoryArgs(args));
-                };
-                history.replaceState = function(...args) {
-                    return oldReplaceState.apply(this, wrapHistoryArgs(args));
-                };
-
-                // 2. Element Attribute Hook
-                const elementProtos = [window.HTMLAnchorElement, window.HTMLImageElement, window.HTMLLinkElement, window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLSourceElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLFormElement];
-                elementProtos.forEach(Proto => {
-                    if (!Proto) return;
-                    const proto = Proto.prototype;
-                    const attrName = (Proto === window.HTMLAnchorElement || Proto === window.HTMLLinkElement || Proto === window.HTMLBaseElement) ? 'href' : 
-                                     (Proto === window.HTMLFormElement) ? 'action' : 'src';
-                    
-                    const descriptor = Object.getOwnPropertyDescriptor(proto, attrName);
-                    if (descriptor && descriptor.set) {
-                        const originalSet = descriptor.set;
-                        Object.defineProperty(proto, attrName, {
-                            set: function(val) {
-                                originalSet.call(this, wrapUrl(val));
-                            },
-                            get: descriptor.get,
-                            enumerable: true,
-                            configurable: true
-                        });
-                    }
-                });
-
-                // 3. Fetch Hook
-                const oldFetch = window.fetch;
-                window.fetch = function(input, init) {
-                    let url = input;
-                    if (typeof input === 'string') {
-                        url = wrapUrl(input);
-                    } else if (input instanceof Request) {
-                        // Cloning request with new URL is tricky, usually easier to just modify string url
-                        url = wrapUrl(input.url);
-                    }
-                    return oldFetch(url, init);
-                };
-
-                // 4. XHR Hook
-                const oldOpen = XMLHttpRequest.prototype.open;
-                XMLHttpRequest.prototype.open = function(method, url, ...args) {
-                    return oldOpen.call(this, method, wrapUrl(url), ...args);
-                };
-
-                // 5. Disable ServiceWorker to prevent bypass
-                if (navigator.serviceWorker) {
-                    navigator.serviceWorker.register = () => new Promise(() => {});
-                    navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
-                }
-              })();
-            </script>`, { html: true });
-          }
-        })
-        .on("a", new AttributeRewriter("href", url.origin, targetUrl.href))
-        .on("img", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("link", new AttributeRewriter("href", url.origin, targetUrl.href))
-        .on("script", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("form", new AttributeRewriter("action", url.origin, targetUrl.href))
-        .on("iframe", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("video", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("audio", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("source", new AttributeRewriter("src", url.origin, targetUrl.href))
-        .on("object", new AttributeRewriter("data", url.origin, targetUrl.href))
-        .on("base", new AttributeRewriter("href", url.origin, targetUrl.href))
-        .on("meta", {
-            element(element) {
-                const httpEquiv = element.getAttribute("http-equiv");
-                if (httpEquiv && httpEquiv.toLowerCase() === "refresh") {
-                    let content = element.getAttribute("content");
-                    if (content) {
-                        const match = content.match(/url\s*=\s*['"]?([^'";]+)['"]?/i);
-                        if (match && match[1]) {
-                             const originalUrl = match[1];
-                             try {
-                                 const absoluteUrl = new URL(originalUrl, targetUrl.href).href;
-                                 const newUrl = url.origin + "/" + absoluteUrl;
-                                 const newContent = content.replace(originalUrl, newUrl);
-                                 element.setAttribute("content", newContent);
-                             } catch(e) {}
-                        }
-                    }
-                }
-            }
-        });
-
-      return rewriter.transform(new Response(response.body, {
-        status: status,
+      // 创建修改后的响应对象
+      const modifiedResponse = new Response(body, {
+        status: response.status,
         statusText: response.statusText,
-        headers: responseHeaders
-      }));
-    }
+        headers: response.headers
+      });
 
-    // C. Binary / Other Content (just stream it)
-    return new Response(response.body, {
-      status: status,
-      statusText: response.statusText,
-      headers: responseHeaders
-    });
+      // 添加禁用缓存的头部
+      setNoCacheHeaders(modifiedResponse.headers);
+
+      // 添加 CORS 头部，允许跨域访问
+      setCorsHeaders(modifiedResponse.headers);
+
+      return modifiedResponse;
+    } catch (error) {
+      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
+      return jsonResponse({
+        error: error.message
+      }, 500);
+    }
   }
 };
 
-class AttributeRewriter {
-  constructor(attributeName, proxyOrigin, currentTargetUrl) {
-    this.attributeName = attributeName;
-    this.proxyOrigin = proxyOrigin;
-    this.currentTargetUrl = currentTargetUrl;
-  }
-
-  element(element) {
-    const value = element.getAttribute(this.attributeName);
-    if (value) {
-      if (value.startsWith("data:") || value.startsWith("#") || value.startsWith("javascript:")) return;
-      try {
-        const resolvedUrl = new URL(value, this.currentTargetUrl).href;
-        element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
-      } catch (e) {}
-    }
-    // Handle srcset for images
-    if (element.tagName === "img" && element.hasAttribute("srcset")) {
-        const srcset = element.getAttribute("srcset");
-        const newSrcset = srcset.split(",").map(part => {
-            const [u, d] = part.trim().split(/\s+/);
-            try {
-                const resolved = new URL(u, this.currentTargetUrl).href;
-                return this.proxyOrigin + "/" + resolved + (d ? " " + d : "");
-            } catch(e) { return part; }
-        }).join(", ");
-        element.setAttribute("srcset", newSrcset);
-    }
-    // Handle data-src commonly used in lazy loading
-    const dataSrc = element.getAttribute("data-src");
-    if (dataSrc) {
-        try {
-            const resolvedUrl = new URL(dataSrc, this.currentTargetUrl).href;
-            element.setAttribute("data-src", this.proxyOrigin + "/" + resolvedUrl);
-        } catch (e) {}
-    }
-  }
+// 确保 URL 带有协议
+function ensureProtocol(url, defaultProtocol) {
+  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
 }
 
+// 处理重定向
+function handleRedirect(response, body) {
+  const location = response.headers.get('location');
+  if (!location) {
+     return response; // 如果没有 location 头，直接返回原响应
+  }
+  const locationUrl = new URL(location);
+  const modifiedLocation = `/${encodeURIComponent(locationUrl.toString())}`;
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: {
+      ...Object.fromEntries(response.headers),
+      'Location': modifiedLocation
+    }
+  });
+}
+
+// 处理 HTML 内容中的相对路径
+async function handleHtmlContent(response, protocol, host, actualUrlStr) {
+  const originalText = await response.text();
+  // 简单的正则替换，用于处理 href="/..." src="/..." 等相对路径
+  // 注意：这只是一个简单的代理实现，复杂的动态加载资源可能无法完美处理
+  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
+
+  return modifiedText;
+}
+
+// 替换 HTML 内容中的相对路径
+function replaceRelativePaths(text, protocol, host, origin) {
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  // 将 /path 替换为 https://proxy-host/target-origin/path
+  // 注意：这里的 replace 逻辑基于原代码意图，但在多层路径下可能需要更复杂的解析
+  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
+}
+
+// 返回 JSON 格式的响应
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+    status: status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8'
+    }
+  });
+}
+
+// 过滤请求头
+function filterHeaders(headers, filterFunc) {
+  const newHeaders = new Headers();
+  for (const [key, value] of headers) {
+    if (filterFunc(key)) {
+      newHeaders.append(key, value);
+    }
+  }
+  return newHeaders;
+}
+
+// 设置禁用缓存的头部
+function setNoCacheHeaders(headers) {
+  headers.set('Cache-Control', 'no-store');
+}
+
+// 设置 CORS 头部
+function setCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Headers', '*');
+}
+
+// 返回根目录的 HTML
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
-  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
   <title>Proxy Everything</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="Description" content="Proxy Everything with CF Workers.">
+  <meta property="og:description" content="Proxy Everything with CF Workers.">
+  <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="robots" content="index, follow">
+  <meta http-equiv="Content-Language" content="zh-CN">
+  <meta name="copyright" content="Copyright © ymyuuu">
+  <meta name="author" content="ymyuuu">
+  <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
   <style>
-      body, html { height: 100%; margin: 0; background-color: #f5f5f5; }
-      .background { height: 100%; display: flex; align-items: center; justify-content: center; }
-      .card { min-width: 350px; }
-      .input-field input:focus + label { color: #26a69a !important; }
-      .input-field input:focus { border-bottom: 1px solid #26a69a !important; box-shadow: 0 1px 0 0 #26a69a !important; }
+      body, html {
+          height: 100%;
+          margin: 0;
+      }
+      .background {
+          background-size: cover;
+          background-position: center;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+      }
+      .card {
+          background-color: rgba(255, 255, 255, 0.8);
+          transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+      .card:hover {
+          background-color: rgba(255, 255, 255, 1);
+          box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
+      }
+      .input-field input[type=text] {
+          color: #2c3e50;
+      }
+      .input-field input[type=text]:focus+label {
+          color: #2c3e50 !important;
+      }
+      .input-field input[type=text]:focus {
+          border-bottom: 1px solid #2c3e50 !important;
+          box-shadow: 0 1px 0 0 #2c3e50 !important;
+      }
+      @media (prefers-color-scheme: dark) {
+          body, html {
+              background-color: #121212;
+              color: #e0e0e0;
+          }
+          .card {
+              background-color: rgba(33, 33, 33, 0.9);
+              color: #ffffff;
+          }
+          .card:hover {
+              background-color: rgba(50, 50, 50, 1);
+              box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
+          }
+          .input-field input[type=text] {
+              color: #ffffff;
+          }
+          .input-field input[type=text]:focus+label {
+              color: #ffffff !important;
+          }
+          .input-field input[type=text]:focus {
+              border-bottom: 1px solid #ffffff !important;
+              box-shadow: 0 1px 0 0 #ffffff !important;
+          }
+          label {
+              color: #cccccc;
+          }
+      }
   </style>
 </head>
 <body>
@@ -444,15 +229,15 @@ function getRootHtml() {
       <div class="container">
           <div class="row">
               <div class="col s12 m8 offset-m2 l6 offset-l3">
-                  <div class="card hoverable">
+                  <div class="card">
                       <div class="card-content">
-                          <span class="card-title center-align"><i class="material-icons left">public</i>Proxy Everything</span>
-                          <form onsubmit="redirectToProxy(event)">
+                          <span class="card-title center-align"><i class="material-icons left">link</i>Proxy Everything</span>
+                          <form id="urlForm" onsubmit="redirectToProxy(event)">
                               <div class="input-field">
-                                  <input type="text" id="targetUrl" placeholder="https://www.google.com" required>
-                                  <label for="targetUrl">Target URL</label>
+                                  <input type="text" id="targetUrl" placeholder="在此输入目标地址" required>
+                                  <label for="targetUrl">目标地址</label>
                               </div>
-                              <button type="submit" class="btn waves-effect waves-light teal lighten-1" style="width: 100%">Go</button>
+                              <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
                           </form>
                       </div>
                   </div>
@@ -460,15 +245,13 @@ function getRootHtml() {
           </div>
       </div>
   </div>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+  <script src="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
   <script>
       function redirectToProxy(event) {
           event.preventDefault();
-          let targetUrl = document.getElementById('targetUrl').value.trim();
-          if (!targetUrl.startsWith('http')) {
-              targetUrl = 'https://' + targetUrl;
-          }
-          window.location.href = window.location.origin + '/' + targetUrl;
+          const targetUrl = document.getElementById('targetUrl').value.trim();
+          const currentOrigin = window.location.origin;
+          window.open(currentOrigin + '/' + encodeURIComponent(targetUrl), '_blank');
       }
   </script>
 </body>
