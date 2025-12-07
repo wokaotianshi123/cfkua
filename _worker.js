@@ -1,34 +1,74 @@
 // _worker.js
 
-// 想要移除的响应头 (解决 CSP, Frame 限制等问题)
-const UNSAFE_HEADERS = new Set([
-  "content-security-policy",
-  "content-security-policy-report-only",
-  "x-frame-options",
-  "x-xss-protection",
-  "x-content-type-options"
+/**
+ * Cloudflare Workers Proxy
+ * 
+ * Combined logic from:
+ * 1. User provided script (HTMLRewriter, UI, URL parsing)
+ * 2. ymyuuu/Cloudflare-Workers-Proxy (Robust CORS handling, Header filtering)
+ */
+
+// Headers to strip from the upstream response to ensure security and proxy functionality
+const PRESERVE_HEADERS = new Set([
+  'content-type',
+  'content-length',
+  'last-modified',
+  'etag',
+  'cache-control',
+  'expires',
+]);
+
+// Headers that interfere with the proxy rendering or security
+const UNSAFE_RESPONSE_HEADERS = new Set([
+  'content-security-policy',
+  'content-security-policy-report-only',
+  'x-frame-options',
+  'x-xss-protection',
+  'x-content-type-options',
+  'report-to',
+  'nel',
+  'access-control-allow-origin',
+  'access-control-allow-methods',
+  'access-control-allow-headers',
+  'access-control-allow-credentials',
+  'access-control-max-age',
+  'access-control-expose-headers'
+]);
+
+// Headers not to send to the upstream server
+const UNSAFE_REQUEST_HEADERS = new Set([
+  'cookie',
+  'host',
+  'origin',
+  'referer',
+  'cf-connecting-ip',
+  'cf-ipcountry',
+  'cf-ray',
+  'cf-visitor',
+  'x-forwarded-proto',
+  'x-real-ip'
 ]);
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. 访问根目录，返回 UI
+    // 1. Root path returns the UI
     if (url.pathname === "/") {
       return new Response(getRootHtml(), {
         headers: { "Content-Type": "text/html; charset=utf-8" }
       });
     }
 
-    // 2. 解析目标 URL
+    // 2. Parse target URL
     let actualUrlStr = url.pathname.slice(1) + url.search + url.hash;
 
-    // 2.1 尝试从路径中修正协议
+    // 2.1 Protocol fix (e.g. https:/google.com -> https://google.com)
     if (actualUrlStr.startsWith("http") && !actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
         actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
     }
 
-    // 2.2 处理相对路径请求
+    // 2.2 Handle relative paths (via Referer)
     if (!actualUrlStr.startsWith("http")) {
       const referer = request.headers.get("Referer");
       if (referer) {
@@ -36,15 +76,12 @@ export default {
           const refererObj = new URL(referer);
           if (refererObj.origin === url.origin) {
             let refererTargetStr = refererObj.pathname.slice(1) + refererObj.search;
-            // 同样修正 Referer 中的协议格式
             if (refererTargetStr.startsWith("http") && !refererTargetStr.startsWith("http://") && !refererTargetStr.startsWith("https://")) {
                 refererTargetStr = refererTargetStr.replace(/^(https?):\/+/, "$1://");
             }
 
             if (refererTargetStr.startsWith("http")) {
                 const targetBase = new URL(refererTargetStr);
-                // 使用 url.pathname (带 /) 而不是 actualUrlStr (不带 /)
-                // 这样 new URL('/path', base) 会正确解析为 root-relative，而不是 path-relative
                 actualUrlStr = new URL(url.pathname + url.search + url.hash, targetBase.href).href;
             }
           }
@@ -52,99 +89,130 @@ export default {
       }
     }
 
-    // 3. 处理 OPTIONS 预检请求
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-          "Access-Control-Allow-Headers": "*"
-        }
-      });
+    // Validate URL
+    if (!actualUrlStr.startsWith("http")) {
+       // If mostly invalid, try adding https:// if it looks like a domain
+       if (actualUrlStr.indexOf('.') > -1 && actualUrlStr.indexOf('/') === -1) {
+           actualUrlStr = 'https://' + actualUrlStr;
+       } else {
+           return new Response("Invalid URL: " + actualUrlStr, { status: 400 });
+       }
     }
 
-    // 4. 准备代理请求
     let targetUrl;
     try {
-      if (!actualUrlStr.startsWith("http")) {
-          return new Response("Invalid URL (No Protocol): " + actualUrlStr, { status: 400 });
-      }
       targetUrl = new URL(actualUrlStr);
     } catch (e) {
       return new Response("Invalid URL Parse Error: " + actualUrlStr, { status: 400 });
     }
 
-    const newHeaders = new Headers();
-    const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(request.method);
+    // 3. Handle OPTIONS (CORS Preflight)
+    // Always return permissive CORS headers for OPTIONS requests
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD",
+          "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
+          "Access-Control-Allow-Credentials": "true",
+          "Access-Control-Max-Age": "86400"
+        }
+      });
+    }
 
-    // 复制原请求头，但过滤掉 CF 特定头、Cookie 和 Security 头
+    // 4. Construct Upstream Request
+    const newHeaders = new Headers();
+    
+    // Copy allowlisted headers
     for (const [key, value] of request.headers) {
       const lowerKey = key.toLowerCase();
-      if (lowerKey.startsWith("cf-") || 
-          lowerKey.startsWith("sec-") || 
-          lowerKey === "cookie") {
-        continue;
+      if (!UNSAFE_REQUEST_HEADERS.has(lowerKey) && !lowerKey.startsWith('cf-')) {
+        newHeaders.set(key, value);
       }
-      newHeaders.set(key, value);
     }
 
-    // 确保 User-Agent 存在
-    if (!newHeaders.has("User-Agent")) {
-        newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
-    }
-
-    // 关键：伪造 Host
+    // Set essential headers for spoofing
     newHeaders.set("Host", targetUrl.host);
+    newHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
     
-    // 只有在非 GET 请求时才发送 Origin
-    if (!isSafeMethod) {
+    // Origin handling: If sending data, set Origin to target, otherwise omit or ensure valid
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
         newHeaders.set("Origin", targetUrl.origin);
     }
     
-    // 智能 Referer 处理
+    // Referer handling
     const clientReferer = request.headers.get("Referer");
     if (clientReferer && clientReferer.startsWith(url.origin)) {
         const realRefererPart = clientReferer.slice(url.origin.length + 1);
-        if (realRefererPart.startsWith("http")) {
-             newHeaders.set("Referer", realRefererPart);
+        // Clean up the extracted referer
+        let fixedReferer = realRefererPart;
+        if (fixedReferer.startsWith("http") && !fixedReferer.startsWith("http://") && !fixedReferer.startsWith("https://")) {
+            fixedReferer = fixedReferer.replace(/^(https?):\/+/, "$1://");
         }
-    } 
+        if (fixedReferer.startsWith("http")) {
+             newHeaders.set("Referer", fixedReferer);
+        }
+    } else {
+        newHeaders.set("Referer", targetUrl.href);
+    }
 
-    // 5. 发起请求
+    // 5. Fetch from Upstream
     let response;
     try {
       response = await fetch(actualUrlStr, {
         method: request.method,
         headers: newHeaders,
         body: request.body,
-        redirect: "manual"
+        redirect: "manual" // We handle redirects manually to rewrite Location
       });
     } catch (e) {
       return new Response("Proxy Fetch Error: " + e.message, { status: 502 });
     }
 
-    // 6. 处理响应头
-    const responseHeaders = new Headers(response.headers);
-    UNSAFE_HEADERS.forEach(h => responseHeaders.delete(h));
+    // 6. Process Response Headers
+    const responseHeaders = new Headers();
+    
+    // Copy upstream headers while filtering unsafe ones
+    for (const [key, value] of response.headers) {
+        const lowerKey = key.toLowerCase();
+        if (!UNSAFE_RESPONSE_HEADERS.has(lowerKey)) {
+            responseHeaders.set(key, value);
+        }
+    }
 
+    // Enforce CORS on Response
     responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD");
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    // Ensure all requested headers are allowed in the response
+    const reqHeaders = request.headers.get("Access-Control-Request-Headers");
+    if (reqHeaders) {
+        responseHeaders.set("Access-Control-Allow-Headers", reqHeaders);
+    } else {
+        responseHeaders.set("Access-Control-Allow-Headers", "*");
+    }
+    responseHeaders.set("Access-Control-Expose-Headers", "*");
 
-    // 重写重定向 Location
-    const location = responseHeaders.get("Location");
+    // Rewrite Location header for redirects
+    const location = response.headers.get("Location");
     if (location) {
       try {
+        // Resolve relative redirects against the target URL
         const absoluteLocation = new URL(location, targetUrl.href).href;
         responseHeaders.set("Location", url.origin + "/" + absoluteLocation);
-      } catch (e) {}
+      } catch (e) {
+        // Fallback if URL resolution fails
+        responseHeaders.set("Location", location);
+      }
     }
 
     const contentType = responseHeaders.get("Content-Type") || "";
+    const status = response.status;
 
-    // 7. 内容处理
+    // 7. Content Rewriting
     
-    // A. M3U8 视频流
+    // A. M3U8 Playlist
     if (contentType.includes("application/vnd.apple.mpegurl") || 
         contentType.includes("application/x-mpegurl") ||
         actualUrlStr.endsWith(".m3u8")) {
@@ -169,13 +237,13 @@ export default {
         });
 
         return new Response(text, {
-            status: response.status,
+            status: status,
             statusText: response.statusText,
             headers: responseHeaders
         });
     }
 
-    // B. HTML 内容
+    // B. HTML Content
     if (contentType.includes("text/html")) {
       const rewriter = new HTMLRewriter()
         .on("head", {
@@ -188,6 +256,7 @@ export default {
 
                 function wrapUrl(u) {
                     if (!u) return u;
+                    if (typeof u !== 'string') return u;
                     if (u.startsWith(PROXY_ORIGIN)) return u;
                     if (u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('javascript:')) return u;
                     try {
@@ -198,12 +267,11 @@ export default {
                     }
                 }
 
-                // 1. 劫持 History API (pushState, replaceState) 防止 SPA 移除代理前缀
+                // 1. History API Hook
                 const oldPushState = history.pushState;
                 const oldReplaceState = history.replaceState;
                 
                 function wrapHistoryArgs(args) {
-                    // args: [state, title, url]
                     if (args.length >= 3 && typeof args[2] === 'string') {
                         args[2] = wrapUrl(args[2]);
                     }
@@ -217,7 +285,7 @@ export default {
                     return oldReplaceState.apply(this, wrapHistoryArgs(args));
                 };
 
-                // 2. 劫持原生属性赋值
+                // 2. Element Attribute Hook
                 const elementProtos = [window.HTMLAnchorElement, window.HTMLImageElement, window.HTMLLinkElement, window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLSourceElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLFormElement];
                 elementProtos.forEach(Proto => {
                     if (!Proto) return;
@@ -230,8 +298,7 @@ export default {
                         const originalSet = descriptor.set;
                         Object.defineProperty(proto, attrName, {
                             set: function(val) {
-                                const wrapped = wrapUrl(val);
-                                originalSet.call(this, wrapped);
+                                originalSet.call(this, wrapUrl(val));
                             },
                             get: descriptor.get,
                             enumerable: true,
@@ -240,23 +307,26 @@ export default {
                     }
                 });
 
-                // 3. 劫持 fetch
+                // 3. Fetch Hook
                 const oldFetch = window.fetch;
                 window.fetch = function(input, init) {
                     let url = input;
                     if (typeof input === 'string') {
                         url = wrapUrl(input);
+                    } else if (input instanceof Request) {
+                        // Cloning request with new URL is tricky, usually easier to just modify string url
+                        url = wrapUrl(input.url);
                     }
                     return oldFetch(url, init);
                 };
 
-                // 4. 劫持 XHR
+                // 4. XHR Hook
                 const oldOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(method, url, ...args) {
                     return oldOpen.call(this, method, wrapUrl(url), ...args);
                 };
 
-                // 5. 禁用 ServiceWorker
+                // 5. Disable ServiceWorker to prevent bypass
                 if (navigator.serviceWorker) {
                     navigator.serviceWorker.register = () => new Promise(() => {});
                     navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
@@ -298,14 +368,15 @@ export default {
         });
 
       return rewriter.transform(new Response(response.body, {
-        status: response.status,
+        status: status,
         statusText: response.statusText,
         headers: responseHeaders
       }));
     }
 
+    // C. Binary / Other Content (just stream it)
     return new Response(response.body, {
-      status: response.status,
+      status: status,
       statusText: response.statusText,
       headers: responseHeaders
     });
@@ -328,6 +399,7 @@ class AttributeRewriter {
         element.setAttribute(this.attributeName, this.proxyOrigin + "/" + resolvedUrl);
       } catch (e) {}
     }
+    // Handle srcset for images
     if (element.tagName === "img" && element.hasAttribute("srcset")) {
         const srcset = element.getAttribute("srcset");
         const newSrcset = srcset.split(",").map(part => {
@@ -339,6 +411,7 @@ class AttributeRewriter {
         }).join(", ");
         element.setAttribute("srcset", newSrcset);
     }
+    // Handle data-src commonly used in lazy loading
     const dataSrc = element.getAttribute("data-src");
     if (dataSrc) {
         try {
