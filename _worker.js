@@ -1,5 +1,10 @@
-// _worker.js
+// _worker.js (融合版)
 
+// ====================== 豆瓣图片代理专用配置 ======================
+const DOUBAN_PROXY_PATH = '/proxy';
+const DOUBAN_ALLOWED_DOMAIN = 'doubanio.com';
+
+// ====================== cfkua 原有配置 ======================
 // 1. 定义需要从响应中移除的安全限制头 (解决 CSP, Frame 限制等)
 const UNSAFE_RESPONSE_HEADERS = new Set([
     "content-security-policy",
@@ -25,6 +30,42 @@ export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
+        // ====================== 第一步：处理豆瓣图片代理逻辑 ======================
+        if (url.pathname === DOUBAN_PROXY_PATH) {
+            return handleDoubanProxy(request, env, ctx);
+        }
+
+        // ====================== 第二步：检查是否是 doubanio.com 域名的代理请求 ======================
+        // 解析 cfkua 模式下的目标 URL
+        let path = url.pathname.slice(1);
+        try { path = decodeURIComponent(path); } catch (e) {}
+        let actualUrlStr = path + url.search + url.hash;
+        
+        // 补全协议（简化版，仅用于域名判断）
+        if (!actualUrlStr.startsWith("http")) {
+            actualUrlStr = 'https://' + actualUrlStr;
+        }
+        try {
+            const targetUrl = new URL(actualUrlStr);
+            // 如果目标域名包含 doubanio.com，转发到豆瓣专用代理逻辑
+            if (targetUrl.host.includes(DOUBAN_ALLOWED_DOMAIN)) {
+                // 构造豆瓣代理的请求 URL
+                const doubanProxyUrl = new URL(DOUBAN_PROXY_PATH, url.origin);
+                doubanProxyUrl.searchParams.set('url', targetUrl.href);
+                // 重建请求到豆瓣代理路径
+                const doubanRequest = new Request(doubanProxyUrl, {
+                    method: request.method,
+                    headers: request.headers,
+                    body: request.body,
+                    redirect: request.redirect
+                });
+                return handleDoubanProxy(doubanRequest, env, ctx);
+            }
+        } catch (e) {
+            // 解析失败则走原有逻辑
+        }
+
+        // ====================== 第三步：原有 cfkua 代理逻辑 ======================
         // 1. 访问根目录，返回 UI
         if (url.pathname === "/") {
             return new Response(getRootHtml(), {
@@ -32,11 +73,10 @@ export default {
             });
         }
 
-        // 2. 解析目标 URL
-        let path = url.pathname.slice(1);
+        // 2. 解析目标 URL (原有逻辑)
+        path = url.pathname.slice(1);
         try { path = decodeURIComponent(path); } catch (e) {}
-
-        let actualUrlStr = path + url.search + url.hash;
+        actualUrlStr = path + url.search + url.hash;
 
         // 补全协议
         if (actualUrlStr.startsWith("http") && !/^https?:\/\//.test(actualUrlStr)) {
@@ -243,6 +283,64 @@ export default {
     }
 };
 
+// ====================== 豆瓣图片代理核心函数 ======================
+async function handleDoubanProxy(request, env, ctx) {
+    const url = new URL(request.url);
+    const targetUrl = url.searchParams.get('url');
+
+    // 参数校验
+    if (!targetUrl) {
+        return new Response('Missing "url" parameter', { status: 400 });
+    }
+
+    // 安全校验：仅允许 doubanio.com 域名
+    if (!targetUrl.includes(DOUBAN_ALLOWED_DOMAIN)) {
+        return new Response('Forbidden: Only Douban images are allowed', { status: 403 });
+    }
+
+    const cache = caches.default;
+    // 检查缓存
+    let response = await cache.match(request);
+
+    if (!response) {
+        // 构造请求头抓取豆瓣图片
+        const doubanHeaders = new Headers();
+        doubanHeaders.set('Referer', 'https://movie.douban.com/');
+        doubanHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
+
+        const imageRes = await fetch(targetUrl, {
+            headers: doubanHeaders,
+        });
+
+        if (!imageRes.ok) {
+            return new Response('Failed to fetch from source', { status: imageRes.status });
+        }
+
+        // 修改响应头，支持缓存和跨域
+        const newHeaders = new Headers(imageRes.headers);
+        
+        // 允许跨域
+        newHeaders.set('Access-Control-Allow-Origin', '*');
+        
+        // 缓存策略：s-maxage 边缘节点缓存 30 天，max-age 浏览器缓存 7 天
+        newHeaders.set('Cache-Control', 'public, s-maxage=2592000, max-age=604800');
+        
+        // 移除可能导致冲突的头
+        newHeaders.delete('Set-Cookie');
+
+        response = new Response(imageRes.body, {
+            status: imageRes.status,
+            headers: newHeaders,
+        });
+
+        // 异步写入缓存
+        ctx.waitUntil(cache.put(request, response.clone()));
+    }
+
+    return response;
+}
+
+// ====================== cfkua 原有工具类 ======================
 // 属性重写类
 class AttrRewriter {
     constructor(attr, proxy, target) {
