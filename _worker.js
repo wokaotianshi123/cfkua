@@ -1,10 +1,5 @@
-// _worker.js (融合版)
+// _worker.js
 
-// ====================== 豆瓣图片代理专用配置 ======================
-const DOUBAN_PROXY_PATH = '/proxy';
-const DOUBAN_ALLOWED_DOMAIN = 'doubanio.com';
-
-// ====================== cfkua 原有配置 ======================
 // 1. 定义需要从响应中移除的安全限制头 (解决 CSP, Frame 限制等)
 const UNSAFE_RESPONSE_HEADERS = new Set([
     "content-security-policy",
@@ -26,90 +21,48 @@ const STRIP_REQUEST_HEADERS = new Set([
     "x-client-ip"
 ]);
 
+// 豆瓣域名白名单（提前定义，加速判断）
+const DOUBAN_WHITELIST = /doubanio\.com$/;
+// 豆瓣请求专属缓存（独立缓存，提升豆瓣资源响应速度）
+const DOUBAN_CACHE_TTL = {
+    sMaxAge: 2592000, // 边缘缓存30天
+    maxAge: 604800    // 浏览器缓存7天
+};
+
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
-        // ====================== 第一步：处理豆瓣图片代理逻辑 ======================
-        if (url.pathname === DOUBAN_PROXY_PATH) {
-            return handleDoubanProxy(request, env, ctx);
-        }
-
-        // ====================== 第二步：检查是否是 doubanio.com 域名的代理请求 ======================
-        // 解析 cfkua 模式下的目标 URL
-        let path = url.pathname.slice(1);
-        try { path = decodeURIComponent(path); } catch (e) {}
-        let actualUrlStr = path + url.search + url.hash;
-        
-        // 补全协议（简化版，仅用于域名判断）
-        if (!actualUrlStr.startsWith("http")) {
-            actualUrlStr = 'https://' + actualUrlStr;
-        }
-        try {
-            const targetUrl = new URL(actualUrlStr);
-            // 如果目标域名包含 doubanio.com，转发到豆瓣专用代理逻辑
-            if (targetUrl.host.includes(DOUBAN_ALLOWED_DOMAIN)) {
-                // 构造豆瓣代理的请求 URL
-                const doubanProxyUrl = new URL(DOUBAN_PROXY_PATH, url.origin);
-                doubanProxyUrl.searchParams.set('url', targetUrl.href);
-                // 重建请求到豆瓣代理路径
-                const doubanRequest = new Request(doubanProxyUrl, {
-                    method: request.method,
-                    headers: request.headers,
-                    body: request.body,
-                    redirect: request.redirect
-                });
-                return handleDoubanProxy(doubanRequest, env, ctx);
-            }
-        } catch (e) {
-            // 解析失败则走原有逻辑
-        }
-
-        // ====================== 第三步：原有 cfkua 代理逻辑 ======================
-        // 1. 访问根目录，返回 UI
+        // ===== 核心优化1：根路径快速响应 =====
         if (url.pathname === "/") {
             return new Response(getRootHtml(), {
                 headers: { "Content-Type": "text/html; charset=utf-8" }
             });
         }
 
-        // 2. 解析目标 URL (原有逻辑)
-        path = url.pathname.slice(1);
+        // ===== 核心优化2：提前解析目标URL并拦截非豆瓣域名 =====
+        // 快速提取目标URL（避免后续复杂解析）
+        let path = url.pathname.slice(1);
         try { path = decodeURIComponent(path); } catch (e) {}
-        actualUrlStr = path + url.search + url.hash;
+        let actualUrlStr = path + url.search + url.hash;
 
-        // 补全协议
-        if (actualUrlStr.startsWith("http") && !/^https?:\/\//.test(actualUrlStr)) {
-            actualUrlStr = actualUrlStr.replace(/^(https?):\/+/, "$1://");
+        // 提前判断：非豆瓣域名且不是OPTIONS预检请求，快速走原有逻辑/拒绝（根据需求调整）
+        let isDoubanRequest = false;
+        try {
+            const tempUrl = new URL(actualUrlStr.startsWith("http") ? actualUrlStr : `https://${actualUrlStr}`);
+            isDoubanRequest = DOUBAN_WHITELIST.test(tempUrl.hostname);
+        } catch (e) {
+            // 无效URL，快速返回400，不进入后续流程
+            return new Response("Invalid URL: " + actualUrlStr, { status: 400 });
         }
 
-        // 处理 Referer 修正 (用于相对路径资源加载)
-        if (!actualUrlStr.startsWith("http")) {
-            const referer = request.headers.get("Referer");
-            if (referer) {
-                try {
-                    const refererObj = new URL(referer);
-                    if (refererObj.origin === url.origin) {
-                        let refererPath = refererObj.pathname.slice(1);
-                        try { refererPath = decodeURIComponent(refererPath); } catch (e) {}
-                        
-                        // 修正 Referer 协议
-                        if (/^https?:\/+/.test(refererPath)) {
-                             refererPath = refererPath.replace(/^(https?):\/+/, "$1://");
-                        }
-                        
-                        // 提取 Referer 的真实 Base URL
-                        if (refererPath.startsWith("http")) {
-                            const targetBase = new URL(refererPath + refererObj.search);
-                            // 基于 Referer 的真实地址解析当前相对路径
-                            actualUrlStr = new URL(url.pathname + url.search, targetBase).href;
-                        }
-                    }
-                } catch (e) {}
-            }
+        // ===== 豆瓣请求专属快速处理（跳过复杂代理逻辑） =====
+        if (isDoubanRequest) {
+            return handleDoubanRequest(request, actualUrlStr, env, ctx);
         }
 
-        // 3. 处理 OPTIONS 预检请求 (CORS)
+        // ===== 非豆瓣请求：原有逻辑（但已提前过滤无效URL，速度提升） =====
+        // 快速处理OPTIONS预检
         if (request.method === "OPTIONS") {
             return new Response(null, {
                 headers: {
@@ -120,7 +73,7 @@ export default {
             });
         }
 
-        // 4. 准备代理请求
+        // 验证目标URL（已提前做过基础验证，此处兜底）
         let targetUrl;
         try {
             targetUrl = new URL(actualUrlStr);
@@ -128,11 +81,10 @@ export default {
             return new Response("Invalid URL: " + actualUrlStr, { status: 400 });
         }
 
-        // 构建请求头 (核心：过滤 IP 和隐私信息)
+        // 构建请求头（核心：过滤 IP 和隐私信息）
         const newHeaders = new Headers();
         for (const [key, value] of request.headers) {
             const lowerKey = key.toLowerCase();
-            // 过滤 CF 内部头、隐私头、Cookie
             if (lowerKey.startsWith("cf-") || 
                 lowerKey.startsWith("sec-") || 
                 lowerKey === "cookie" ||
@@ -148,7 +100,7 @@ export default {
         }
         newHeaders.set("Host", targetUrl.host);
 
-        // 智能 Referer 处理 (欺骗目标服务器)
+        // 智能 Referer 处理
         const clientReferer = request.headers.get("Referer");
         if (clientReferer && clientReferer.startsWith(url.origin)) {
             try {
@@ -160,7 +112,7 @@ export default {
             } catch(e){}
         }
 
-        // 5. 发起请求
+        // 发起请求
         let response;
         try {
             response = await fetch(actualUrlStr, {
@@ -173,13 +125,9 @@ export default {
             return new Response("Proxy Error: " + e.message, { status: 502 });
         }
 
-        // 6. 处理响应头
+        // 处理响应头
         const responseHeaders = new Headers(response.headers);
-        
-        // 移除安全限制
         UNSAFE_RESPONSE_HEADERS.forEach(h => responseHeaders.delete(h));
-
-        // 添加 CORS
         responseHeaders.set("Access-Control-Allow-Origin", "*");
         responseHeaders.set("Access-Control-Allow-Credentials", "true");
         responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -195,26 +143,20 @@ export default {
 
         const contentType = responseHeaders.get("Content-Type") || "";
 
-        // 7. 内容重写处理
-
-        // A. M3U8 视频流处理
+        // M3U8 处理
         if (contentType.includes("mpegurl") || actualUrlStr.endsWith(".m3u8")) {
             const text = await response.text();
             const baseUrl = actualUrlStr.substring(0, actualUrlStr.lastIndexOf("/") + 1);
-            
-            // 使用正则替换 M3U8 内部链接，不持有过多对象引用
             const newText = text.replace(/^(?!#)(?!\s)(.+)$/gm, (match) => {
                 match = match.trim();
                 if (!match) return match;
                 try {
-                    // 如果是绝对路径直接用，相对路径则拼接 BaseURL
                     const absoluteUrl = match.startsWith("http") ? match : new URL(match, baseUrl).href;
                     return url.origin + "/" + absoluteUrl;
                 } catch (e) {
                     return match;
                 }
             });
-
             return new Response(newText, {
                 status: response.status,
                 statusText: response.statusText,
@@ -222,9 +164,8 @@ export default {
             });
         }
 
-        // B. HTML 内容处理 (注入脚本 + 重写链接)
+        // HTML 处理
         if (contentType.includes("text/html")) {
-            // 压缩后的注入脚本
             const injectScript = `
             (function(){
                 const P=window.location.origin, B='${targetUrl.href}';
@@ -251,11 +192,10 @@ export default {
                 if(navigator.serviceWorker){navigator.serviceWorker.register=()=>new Promise(()=>{});navigator.serviceWorker.getRegistrations().then(r=>r.forEach(s=>s.unregister()))}
             })();
             `;
-
             const rewriter = new HTMLRewriter()
                 .on("head", { element(e) { e.append(`<script>${injectScript}</script>`, { html: true }); } })
                 .on("a", new AttrRewriter("href", url.origin, targetUrl.href))
-                .on("img", new AttrRewriter("src", url.origin, targetUrl.href)) // img 另外处理 srcset
+                .on("img", new AttrRewriter("src", url.origin, targetUrl.href))
                 .on("link", new AttrRewriter("href", url.origin, targetUrl.href))
                 .on("script", new AttrRewriter("src", url.origin, targetUrl.href))
                 .on("form", new AttrRewriter("action", url.origin, targetUrl.href))
@@ -266,7 +206,6 @@ export default {
                 .on("object", new AttrRewriter("data", url.origin, targetUrl.href))
                 .on("base", new AttrRewriter("href", url.origin, targetUrl.href))
                 .on("meta", new MetaRewriter(url.origin, targetUrl.href));
-
             return rewriter.transform(new Response(response.body, {
                 status: response.status,
                 statusText: response.statusText,
@@ -283,64 +222,47 @@ export default {
     }
 };
 
-// ====================== 豆瓣图片代理核心函数 ======================
-async function handleDoubanProxy(request, env, ctx) {
-    const url = new URL(request.url);
-    const targetUrl = url.searchParams.get('url');
-
-    // 参数校验
-    if (!targetUrl) {
-        return new Response('Missing "url" parameter', { status: 400 });
-    }
-
-    // 安全校验：仅允许 doubanio.com 域名
-    if (!targetUrl.includes(DOUBAN_ALLOWED_DOMAIN)) {
-        return new Response('Forbidden: Only Douban images are allowed', { status: 403 });
-    }
-
+// ===== 豆瓣请求专属处理函数（独立逻辑，极致优化） =====
+async function handleDoubanRequest(request, targetUrlStr, env, ctx) {
+    // 1. 优先查缓存（豆瓣资源缓存命中率高，跳过所有解析直接返回）
     const cache = caches.default;
-    // 检查缓存
     let response = await cache.match(request);
 
     if (!response) {
-        // 构造请求头抓取豆瓣图片
+        // 2. 缓存未命中：极简请求头（仅豆瓣必要头，无冗余处理）
         const doubanHeaders = new Headers();
         doubanHeaders.set('Referer', 'https://movie.douban.com/');
         doubanHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
 
-        const imageRes = await fetch(targetUrl, {
+        // 3. 极简请求（无重定向、无body处理，豆瓣图片都是GET）
+        const imageRes = await fetch(targetUrlStr, {
+            method: 'GET',
             headers: doubanHeaders,
+            redirect: 'follow' // 豆瓣图片允许重定向，减少处理逻辑
         });
 
         if (!imageRes.ok) {
-            return new Response('Failed to fetch from source', { status: imageRes.status });
+            return new Response('Failed to fetch Douban resource', { status: imageRes.status });
         }
 
-        // 修改响应头，支持缓存和跨域
+        // 4. 极简响应头（仅必要配置，无冗余删除）
         const newHeaders = new Headers(imageRes.headers);
-        
-        // 允许跨域
         newHeaders.set('Access-Control-Allow-Origin', '*');
-        
-        // 缓存策略：s-maxage 边缘节点缓存 30 天，max-age 浏览器缓存 7 天
-        newHeaders.set('Cache-Control', 'public, s-maxage=2592000, max-age=604800');
-        
-        // 移除可能导致冲突的头
+        newHeaders.set('Cache-Control', `public, s-maxage=${DOUBAN_CACHE_TTL.sMaxAge}, max-age=${DOUBAN_CACHE_TTL.maxAge}`);
         newHeaders.delete('Set-Cookie');
 
         response = new Response(imageRes.body, {
             status: imageRes.status,
-            headers: newHeaders,
+            headers: newHeaders
         });
 
-        // 异步写入缓存
+        // 5. 异步写入缓存（不阻塞响应）
         ctx.waitUntil(cache.put(request, response.clone()));
     }
 
     return response;
 }
 
-// ====================== cfkua 原有工具类 ======================
 // 属性重写类
 class AttrRewriter {
     constructor(attr, proxy, target) {
@@ -355,7 +277,6 @@ class AttrRewriter {
                 el.setAttribute(this.attr, this.proxy + "/" + new URL(val, this.target).href);
             } catch (e) {}
         }
-        // 特殊处理 srcset
         if (el.tagName === "img") {
             const srcset = el.getAttribute("srcset");
             if (srcset) {
@@ -368,7 +289,6 @@ class AttrRewriter {
                 }).join(", ");
                 el.setAttribute("srcset", newSrcset);
             }
-            // 处理懒加载 data-src
             const dSrc = el.getAttribute("data-src");
             if (dSrc) {
                 try {
