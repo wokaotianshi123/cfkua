@@ -1,34 +1,21 @@
 // _workerkua.js
 
-// 限制配置：移除安全头以免浏览器阻塞代理内容
-const UNSAFE_RESPONSE_HEADERS = new Set([
-    "content-security-policy", "content-security-policy-report-only", 
-    "x-frame-options", "x-xss-protection", "x-content-type-options"
-]);
-
-// 隐私保护：移除客户端的敏感IP头
-const STRIP_REQUEST_HEADERS = new Set([
-    "cf-connecting-ip", "x-forwarded-for", "x-real-ip", 
-    "client-ip", "x-forwarded-proto", "via", "forwarded", "x-client-ip"
-]);
+// 限制配置
+const UNSAFE_RESPONSE_HEADERS = new Set(["content-security-policy", "content-security-policy-report-only", "x-frame-options", "x-xss-protection", "x-content-type-options"]);
+const STRIP_REQUEST_HEADERS = new Set(["cf-connecting-ip", "x-forwarded-for", "x-real-ip", "client-ip", "x-forwarded-proto", "via", "forwarded", "x-client-ip"]);
 
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
-        // 1. 豆瓣图片代理功能 (高性能缓存)
+        // 1. 豆瓣图片代理
         if (url.pathname === '/proxy') {
             const targetUrl = url.searchParams.get('url');
             if (targetUrl && targetUrl.includes('doubanio.com')) {
                 const cache = caches.default;
                 let response = await cache.match(request);
                 if (!response) {
-                    const imageRes = await fetch(targetUrl, {
-                        headers: {
-                            'Referer': 'https://movie.douban.com/',
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-                        }
-                    });
+                    const imageRes = await fetch(targetUrl, { headers: { 'Referer': 'https://movie.douban.com/', 'User-Agent': 'Mozilla/5.0' } });
                     if (imageRes.ok) {
                         const newHeaders = new Headers(imageRes.headers);
                         newHeaders.set('Access-Control-Allow-Origin', '*');
@@ -42,47 +29,32 @@ export default {
             }
         }
 
-        // 2. 主页面 (HTML Proxy 入口)
+        // 2. 根目录 UI
         if (url.pathname === "/") {
             return new Response(getRootHtml(), { headers: { "Content-Type": "text/html; charset=utf-8" } });
         }
 
-        // 3. 复杂 HTML/Proxy 逻辑解析
-        // 尝试从 pathname 中提取目标 URL
+        // 3. 核心代理逻辑
         let path = url.pathname.slice(1);
-        if (!path) return new Response(getRootHtml(), { headers: { "Content-Type": "text/html; charset=utf-8" } });
-        
         try { path = decodeURIComponent(path); } catch (e) {}
+        if (!path) return new Response("Invalid Request", { status: 400 });
 
-        // 如果路径不是以 http 开头，自动补全协议
+        // 规范化目标 URL
         let actualUrlStr = (path.startsWith("http") ? path : "https://" + path) + url.search + url.hash;
-
-        if (request.method === "OPTIONS") {
-            return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*" } });
-        }
-
         const targetUrl = new URL(actualUrlStr);
+
+        // 请求头清洗
         const newHeaders = new Headers();
-        
-        // 过滤和构建请求头
         for (const [key, value] of request.headers) {
             const lowerKey = key.toLowerCase();
             if (lowerKey.startsWith("cf-") || lowerKey.startsWith("sec-") || lowerKey === "cookie" || STRIP_REQUEST_HEADERS.has(lowerKey)) continue;
             newHeaders.set(key, value);
         }
-        
-        // 伪造关键头，确保流媒体请求通畅
         newHeaders.set("Host", targetUrl.host);
-        newHeaders.set("Referer", targetUrl.origin + "/"); 
-        newHeaders.set("Origin", targetUrl.origin);
+        // 关键：强制设置 Referer 以防止 403
+        newHeaders.set("Referer", targetUrl.origin + "/");
 
-        // 代理请求
-        let response = await fetch(actualUrlStr, { 
-            method: request.method, 
-            headers: newHeaders, 
-            body: request.body, 
-            redirect: "manual" 
-        });
+        let response = await fetch(actualUrlStr, { method: request.method, headers: newHeaders, body: request.body, redirect: "manual" });
 
         const responseHeaders = new Headers(response.headers);
         UNSAFE_RESPONSE_HEADERS.forEach(h => responseHeaders.delete(h));
@@ -90,67 +62,65 @@ export default {
 
         const contentType = responseHeaders.get("Content-Type") || "";
 
-        // 4. M3U8 流处理 (增强逻辑)
+        // 4. M3U8 流媒体极致兼容处理
         if (contentType.includes("mpegurl") || actualUrlStr.endsWith(".m3u8")) {
             const text = await response.text();
-            // 计算资源根目录用于补全相对路径
-            const baseUrl = targetUrl.origin + targetUrl.pathname.substring(0, targetUrl.pathname.lastIndexOf("/") + 1);
+            const baseUrl = targetUrl.toString().substring(0, targetUrl.toString().lastIndexOf("/") + 1);
             
-            // 使用正则修正所有非注释行的链接，并进行编码
-            const newText = text.replace(/^(?!#)(?!\s)(.+)$/gm, (match) => {
-                const segmentUrl = new URL(match.trim(), baseUrl).href;
-                return `${url.origin}/${encodeURIComponent(segmentUrl)}`;
+            // 确保所有的 URL 都被代理，包括 #EXT-X-STREAM-INF 后面的 URL
+            const newText = text.replace(/(https?:\/\/[^\s"'()]+|[^#\s"']+\.ts|[^#\s"']+\.m3u8)/g, (match) => {
+                const absUrl = new URL(match, baseUrl).href;
+                return url.origin + "/" + encodeURIComponent(absUrl);
             });
-            
             return new Response(newText, { headers: responseHeaders });
         }
 
-        // 5. HTML 内容重写 (增强交互)
+        // 5. HTML 内容注入 (解决 JS 导航导致跳出代理的问题)
         if (contentType.includes("text/html")) {
+            const injectScript = `
+            <script>
+            (function(){
+                const proxyOrigin = window.location.origin;
+                // 劫持所有动态请求
+                const originalFetch = window.fetch;
+                window.fetch = function(u, n) {
+                    if (typeof u === 'string' && u.startsWith('http')) return originalFetch(proxyOrigin + '/' + encodeURIComponent(u), n);
+                    return originalFetch(u, n);
+                };
+                // 劫持所有 History API，防止页面路径跳出代理
+                const historyPush = window.history.pushState;
+                window.history.pushState = function(s, t, url) {
+                    console.log('History blocked or proxied', url);
+                    return historyPush.apply(this, [s, t, url]);
+                };
+            })();
+            </script>`;
+
             const rewriter = new HTMLRewriter()
-                .on("a, link, script, img, iframe, form, source, video, audio, object, base", new AttrRewriter(url.origin, targetUrl.href));
+                .on("head", { element(e) { e.append(injectScript, { html: true }); } })
+                .on("a, link, script, img, iframe, form, source, video, audio, object, base", new AttrRewriter(url.origin));
+            
             return rewriter.transform(new Response(response.body, { headers: responseHeaders }));
         }
 
-        // 普通资源透传
         return new Response(response.body, { headers: responseHeaders });
     }
 };
 
-/** 辅助功能 **/
-
 class AttrRewriter {
-    constructor(proxy, target) { 
-        this.proxy = proxy; 
-        this.target = target; 
-    }
+    constructor(proxy) { this.proxy = proxy; }
     element(el) {
         const attr = el.tagName === 'form' ? 'action' : (el.tagName === 'link' || el.tagName === 'a' || el.tagName === 'base' ? 'href' : 'src');
         const val = el.getAttribute(attr);
-        if (val && !val.startsWith("data:") && !val.startsWith("#") && !val.startsWith("javascript:")) {
-            try { 
-                const absoluteUrl = new URL(val, this.target).href;
-                el.setAttribute(attr, `${this.proxy}/${encodeURIComponent(absoluteUrl)}`); 
-            } catch (e) {}
-        }
-        
-        // 针对懒加载元素
-        if (el.getAttribute("data-src")) {
-            try {
-                const abs = new URL(el.getAttribute("data-src"), this.target).href;
-                el.setAttribute("data-src", `${this.proxy}/${encodeURIComponent(abs)}`);
-            } catch(e) {}
+        if (val && val.startsWith('http')) {
+            el.setAttribute(attr, this.proxy + "/" + encodeURIComponent(val));
         }
     }
 }
 
 function getRootHtml() {
-    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>Secure Proxy</title>
-    <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f4;}
-    .box{text-align:center;padding:20px;background:#fff;border-radius:10px;box-shadow:0 4px 6px rgba(0,0,0,0.1);}</style></head>
-    <body><div class="box">
-    <h2>URL 代理工具</h2>
-    <form onsubmit="event.preventDefault();window.open(location.origin+'/'+encodeURIComponent(document.getElementById('u').value),'_blank')">
-    <input type="text" id="u" placeholder="输入完整网址" style="width:300px;padding:8px;">
-    <button type="submit">跳转</button></form></div></body></html>`;
+    return `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:50px;">
+    <h2>Secure Proxy</h2><form onsubmit="event.preventDefault();window.location.href=location.origin+'/'+encodeURIComponent(document.getElementById('u').value)">
+    <input type="text" id="u" placeholder="输入网址" style="width:300px;padding:10px;">
+    <button type="submit">Go</button></form></body></html>`;
 }
